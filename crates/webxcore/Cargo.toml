@@ -8,4 +8,18 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+http.workspace = true
+hyper = { workspace = true, features = ["http1", "http2", "server"] }
+hyper-util = { workspace = true, features = ["http1", "http2", "server-auto", "server-graceful", "tokio"] }
+serde.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }
+toml.workspace = true
+tracing.workspace = true
 webxlib.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "rt-multi-thread", "sync"] }

@@ -15,14 +15,21 @@ webxcore = { path = "crates/webxcore" }
 bytes = "1.12.1"
 cap-fs-ext = "4.0.3"
 cap-std = "4.0.3"
+clap = { version = "4.6.7", features = ["derive"] }
 futures-core = "0.3.34"
 futures-util = { version = "0.3.34", default-features = false }
 http = "1.5.0"
 http-body = "1.1.0"
 http-body-util = "0.1.5"
 httpdate = "1.0.3"
+hyper = "1.12.0"
+hyper-util = "0.1.21"
 mime_guess = { version = "2.0.5", default-features = false }
 percent-encoding = "2.3.2"
+serde = { version = "1.0.229", features = ["derive"] }
 tempfile = "3.27.0"
 tokio = "1.53.3"
 tokio-util = "0.7.20"
+toml = "1.1.8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
