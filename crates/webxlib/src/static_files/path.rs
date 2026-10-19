@@ -52,9 +52,7 @@ pub fn sanitize(path: &str, policy: PathPolicy) -> Result<SafePath, PathError> {
     let mut relative = PathBuf::new();
 
     for raw in rest.split('/') {
-        let segment = percent_decode_str(raw)
-            .decode_utf8()
-            .map_err(|_| PathError::Invalid)?;
+        let segment = percent_decode_str(raw).decode_utf8().map_err(|_| PathError::Invalid)?;
         match segment.as_ref() {
             "" | "." => {}
             ".." => {
@@ -69,10 +67,7 @@ pub fn sanitize(path: &str, policy: PathPolicy) -> Result<SafePath, PathError> {
         }
     }
 
-    Ok(SafePath {
-        relative,
-        trailing_slash: path.ends_with('/'),
-    })
+    Ok(SafePath { relative, trailing_slash: path.ends_with('/') })
 }
 
 pub(super) fn check_segment(
@@ -117,10 +112,7 @@ mod tests {
         symlinks: Symlinks::InsideRoot,
         directory_listing: false,
     };
-    const ALLOW: PathPolicy = PathPolicy {
-        allow_dotfiles: true,
-        ..DENY
-    };
+    const ALLOW: PathPolicy = PathPolicy { allow_dotfiles: true, ..DENY };
 
     fn ok(path: &str) -> SafePath {
         sanitize(path, DENY).unwrap()

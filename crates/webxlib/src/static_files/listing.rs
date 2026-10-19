@@ -100,10 +100,7 @@ mod tests {
     use super::*;
 
     fn entry(name: &str, is_dir: bool) -> Entry {
-        Entry {
-            name: name.to_owned(),
-            is_dir,
-        }
+        Entry { name: name.to_owned(), is_dir }
     }
 
     fn page(relative: &str, entries: Vec<Entry>) -> String {

@@ -171,9 +171,8 @@ mod tests {
 
     #[test]
     fn parses_entity_tag_lists() {
-        let tags: Vec<_> = entity_tags(r#" "a", W/"b",,"c,d" "#)
-            .map(|t| (t.weak, t.opaque))
-            .collect();
+        let tags: Vec<_> =
+            entity_tags(r#" "a", W/"b",,"c,d" "#).map(|t| (t.weak, t.opaque)).collect();
         let expected = [(false, "\"a\""), (true, "\"b\""), (false, "\"c,d\"")];
         assert_eq!(tags, expected);
         assert_eq!(entity_tags(r#""a", bad, "c""#).count(), 1);

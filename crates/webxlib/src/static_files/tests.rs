@@ -89,9 +89,7 @@ async fn file_with_content_type() {
 #[tokio::test]
 async fn head_has_headers_but_no_body() {
     let site = Site::new();
-    let res = site
-        .request(Method::HEAD, "/style.css", PathPolicy::default())
-        .await;
+    let res = site.request(Method::HEAD, "/style.css", PathPolicy::default()).await;
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(header(&res, CONTENT_LENGTH), "6");
     assert!(body(res).await.is_empty());
@@ -207,9 +205,7 @@ mod pages {
     #[tokio::test]
     async fn head_error_has_length_but_no_body() {
         let site = Site::new();
-        let res = site
-            .request(Method::HEAD, "/missing.html", PathPolicy::default())
-            .await;
+        let res = site.request(Method::HEAD, "/missing.html", PathPolicy::default()).await;
         let expected = crate::pages::error(StatusCode::NOT_FOUND).len().to_string();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         assert_eq!(header(&res, CONTENT_LENGTH), expected);
@@ -368,10 +364,7 @@ mod symlinks {
     }
 
     async fn get_with(site: &Site, uri: &str, symlinks: Symlinks) -> Response<Body> {
-        let policy = PathPolicy {
-            symlinks,
-            ..PathPolicy::default()
-        };
+        let policy = PathPolicy { symlinks, ..PathPolicy::default() };
         site.request(Method::GET, uri, policy).await
     }
 
@@ -413,11 +406,7 @@ mod symlinks {
 
     async fn root_listing(site: &Site, symlinks: Symlinks) -> String {
         fs::remove_file(site.dir.path().join("www/index.html")).unwrap();
-        let policy = PathPolicy {
-            symlinks,
-            directory_listing: true,
-            ..PathPolicy::default()
-        };
+        let policy = PathPolicy { symlinks, directory_listing: true, ..PathPolicy::default() };
         let res = site.request(Method::GET, "/", policy).await;
         String::from_utf8(body(res).await.to_vec()).unwrap()
     }

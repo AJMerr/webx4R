@@ -7,19 +7,12 @@ use http::StatusCode;
 
 /// Shown at a site's root when it has no `index.html`.
 pub fn welcome() -> Bytes {
-    render(
-        "webx4R is online",
-        "add an index.html to this site's root to replace this page",
-    )
+    render("webx4R is online", "add an index.html to this site's root to replace this page")
 }
 
 /// The default page for an error status.
 pub fn error(code: StatusCode) -> Bytes {
-    let title = format!(
-        "{} {}",
-        code.as_u16(),
-        code.canonical_reason().unwrap_or("Error")
-    );
+    let title = format!("{} {}", code.as_u16(), code.canonical_reason().unwrap_or("Error"));
     render(&title, message(code))
 }
 

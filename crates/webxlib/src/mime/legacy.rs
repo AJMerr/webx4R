@@ -13,10 +13,7 @@ pub(super) const TYPES: &[(&str, &str)] = &[
     ("aim", "application/x-aim"),
     ("aip", "text/x-audiosoft-intra"),
     ("ani", "application/x-navi-animation"),
-    (
-        "aos",
-        "application/x-nokia-9000-communicator-add-on-software",
-    ),
+    ("aos", "application/x-nokia-9000-communicator-add-on-software"),
     ("aps", "application/mime"),
     ("asp", "text/asp"),
     ("avs", "video/avs-video"),

@@ -20,10 +20,7 @@ pub struct Body(Kind);
 enum Kind {
     Empty,
     Bytes(Option<Bytes>),
-    File {
-        stream: ReaderStream<Take<File>>,
-        remaining: u64,
-    },
+    File { stream: ReaderStream<Take<File>>, remaining: u64 },
 }
 
 impl Body {
@@ -33,11 +30,7 @@ impl Body {
 
     pub fn bytes(bytes: impl Into<Bytes>) -> Self {
         let bytes = bytes.into();
-        if bytes.is_empty() {
-            Self::empty()
-        } else {
-            Self(Kind::Bytes(Some(bytes)))
-        }
+        if bytes.is_empty() { Self::empty() } else { Self(Kind::Bytes(Some(bytes))) }
     }
 
     /// Streams `len` bytes from the file's current position.

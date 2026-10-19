@@ -81,9 +81,7 @@ impl StaticFiles {
     pub fn new(root: impl AsRef<Path>, policy: PathPolicy) -> io::Result<Self> {
         let root = std::fs::canonicalize(root)?;
         let dir = Dir::open_ambient_dir(&root, ambient_authority())?;
-        Ok(Self {
-            inner: Arc::new(Inner { dir, root, policy }),
-        })
+        Ok(Self { inner: Arc::new(Inner { dir, root, policy }) })
     }
 
     pub async fn serve<B>(&self, req: &Request<B>) -> Response<Body> {
@@ -137,8 +135,7 @@ impl StaticFiles {
         };
         *res.status_mut() = code;
         if code == StatusCode::METHOD_NOT_ALLOWED {
-            res.headers_mut()
-                .insert(ALLOW, HeaderValue::from_static("GET, HEAD"));
+            res.headers_mut().insert(ALLOW, HeaderValue::from_static("GET, HEAD"));
         }
         res
     }
@@ -182,11 +179,7 @@ impl Inner {
 
     /// The open is sandboxed, so a link swapped after the metadata check still can't escape.
     fn locate_inside_root(&self, relative: &Path) -> io::Result<Target> {
-        let path = if relative.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            relative
-        };
+        let path = if relative.as_os_str().is_empty() { Path::new(".") } else { relative };
         let meta = self.dir.metadata(path)?;
         if meta.is_dir() {
             return Ok(Target::Dir(self.dir.open_dir(path)?));
@@ -320,11 +313,7 @@ fn serve_file<B>(
 
 fn file_response(name: &Path, open: OpenFile, head: bool) -> Response<Body> {
     let OpenFile { file, len, .. } = open;
-    let body = if head {
-        Body::empty()
-    } else {
-        Body::file(file, len)
-    };
+    let body = if head { Body::empty() } else { Body::file(file, len) };
     let content_type = HeaderValue::from_str(&mime::content_type(name))
         .unwrap_or(HeaderValue::from_static(mime::OCTET_STREAM));
 
@@ -337,11 +326,7 @@ fn file_response(name: &Path, open: OpenFile, head: bool) -> Response<Body> {
 
 fn html_response(page: Bytes, head: bool) -> Response<Body> {
     let len = page.len();
-    let body = if head {
-        Body::empty()
-    } else {
-        Body::bytes(page)
-    };
+    let body = if head { Body::empty() } else { Body::bytes(page) };
 
     let mut res = Response::new(body);
     let headers = res.headers_mut();
