@@ -17,7 +17,7 @@ pub struct PathPolicy {
 pub enum Symlinks {
     /// Follow every link, wherever it points.
     Follow,
-    /// Follow links whose target is inside the site root.
+    /// Follow relative links that stay inside the site root; absolute targets are refused.
     #[default]
     InsideRoot,
     /// Refuse any path that goes through a link.

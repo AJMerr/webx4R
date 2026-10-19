@@ -142,18 +142,35 @@ async fn other_methods_are_not_allowed() {
     assert_eq!(header(&res, ALLOW), "GET, HEAD");
 }
 
-#[cfg(unix)]
 mod symlinks {
-    use std::os::unix::fs::symlink;
+    use std::path::Path;
 
     use super::*;
+
+    fn link_file(target: impl AsRef<Path>, link: impl AsRef<Path>) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(target, link).unwrap();
+    }
+
+    fn link_dir(target: impl AsRef<Path>, link: impl AsRef<Path>) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(target, link).unwrap();
+    }
 
     fn site_with_links() -> Site {
         let site = Site::new();
         let root = site.dir.path().join("www");
-        let outside = site.dir.path().join("outside/secret.txt");
-        symlink(root.join("style.css"), root.join("link-in.css")).unwrap();
-        symlink(outside, root.join("link-out.txt")).unwrap();
+        let secret = site.dir.path().join("outside/secret.txt");
+        let relative_secret = Path::new("..").join("outside/secret.txt");
+        link_file("style.css", root.join("link-in.css"));
+        link_file(root.join("style.css"), root.join("abs-in.css"));
+        link_file(secret, root.join("link-out.txt"));
+        link_file(relative_secret, root.join("rel-out.txt"));
+        link_dir("docs", root.join("docs-link"));
         site
     }
 
@@ -169,7 +186,15 @@ mod symlinks {
     async fn inside_root_is_the_default() {
         let site = site_with_links();
         assert_eq!(site.status("/link-in.css").await, StatusCode::OK);
+        assert_eq!(site.status("/docs-link/").await, StatusCode::OK);
         assert_eq!(site.status("/link-out.txt").await, StatusCode::NOT_FOUND);
+        assert_eq!(site.status("/rel-out.txt").await, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn inside_root_refuses_absolute_targets() {
+        let site = site_with_links();
+        assert_eq!(site.status("/abs-in.css").await, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -184,9 +209,13 @@ mod symlinks {
     async fn deny_refuses_every_link() {
         let site = site_with_links();
         let link = get_with(&site, "/link-in.css", Symlinks::Deny).await;
-        let plain = get_with(&site, "/style.css", Symlinks::Deny).await;
+        let dir_link = get_with(&site, "/docs-link/index.html", Symlinks::Deny).await;
+        let plain = get_with(&site, "/docs/index.html", Symlinks::Deny).await;
+        let root = get_with(&site, "/", Symlinks::Deny).await;
         assert_eq!(link.status(), StatusCode::NOT_FOUND);
+        assert_eq!(dir_link.status(), StatusCode::NOT_FOUND);
         assert_eq!(plain.status(), StatusCode::OK);
+        assert_eq!(root.status(), StatusCode::OK);
     }
 
     #[tokio::test]

@@ -9,12 +9,14 @@ publish.workspace = true
 
 [dependencies]
 bytes.workspace = true
+cap-fs-ext.workspace = true
+cap-std.workspace = true
 futures-core.workspace = true
 http.workspace = true
 http-body.workspace = true
 mime_guess.workspace = true
 percent-encoding.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util"] }
+tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
 tokio-util = { workspace = true, features = ["io"] }
 
 [dev-dependencies]

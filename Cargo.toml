@@ -13,6 +13,8 @@ publish = false
 webxlib = { path = "crates/webxlib" }
 webxcore = { path = "crates/webxcore" }
 bytes = "1.12.1"
+cap-fs-ext = "4.0.3"
+cap-std = "4.0.3"
 futures-core = "0.3.34"
 http = "1.5.0"
 http-body = "1.1.0"
