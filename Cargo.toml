@@ -1,0 +1,14 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/AJMerr/webx4R"
+publish = false
+
+[workspace.dependencies]
+webxlib = { path = "crates/webxlib" }
+webxcore = { path = "crates/webxcore" }

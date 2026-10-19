@@ -1,0 +1,11 @@
+[package]
+name = "webx4r"
+description = "Command-line interface for the webx4R app platform."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+webxcore.workspace = true
