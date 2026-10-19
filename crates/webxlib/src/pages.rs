@@ -3,11 +3,26 @@
 //! Pages are built only from fixed strings; nothing from the request is echoed back.
 
 use bytes::Bytes;
-use http::StatusCode;
+use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use http::{HeaderValue, Response, StatusCode};
+
+use crate::body::Body;
 
 /// Shown at a site's root when it has no `index.html`.
 pub fn welcome() -> Bytes {
     render("webx4R is online", "add an index.html to this site's root to replace this page")
+}
+
+/// A complete response carrying the default page for `code`.
+pub fn error_response(code: StatusCode) -> Response<Body> {
+    let page = error(code);
+    let len = page.len();
+    let mut res = Response::new(Body::bytes(page));
+    *res.status_mut() = code;
+    let headers = res.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    headers.insert(CONTENT_LENGTH, HeaderValue::from(len));
+    res
 }
 
 /// The default page for an error status.
@@ -27,6 +42,7 @@ fn message(code: StatusCode) -> &'static str {
         }
         StatusCode::PRECONDITION_FAILED => "a condition in the request was not met",
         StatusCode::RANGE_NOT_SATISFIABLE => "the requested range is outside the file",
+        StatusCode::MISDIRECTED_REQUEST => "this server has no site for the requested hostname",
         StatusCode::INTERNAL_SERVER_ERROR => "the server encountered an unexpected error",
         StatusCode::BAD_GATEWAY => "the server got an invalid response from an upstream server",
         StatusCode::SERVICE_UNAVAILABLE => "the server is temporarily unable to handle the request",
