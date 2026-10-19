@@ -1,5 +1,6 @@
 //! Serves files from a site root, following the original webxlib's behavior.
 
+mod listing;
 mod path;
 #[cfg(test)]
 mod tests;
@@ -20,6 +21,8 @@ use tokio::fs::File;
 use crate::body::Body;
 use crate::{mime, pages};
 
+use listing::Entry;
+use path::check_segment;
 pub use path::{PathError, PathPolicy, SafePath, Symlinks, sanitize};
 
 /// Served when a directory is requested with a trailing slash.
@@ -58,8 +61,12 @@ struct Inner {
 
 /// What a sanitized path refers to.
 enum Target {
-    File { file: File, len: u64 },
-    Dir,
+    File {
+        file: File,
+        len: u64,
+    },
+    /// An open handle, so later reads use the directory that passed the policy checks.
+    Dir(Dir),
 }
 
 impl StaticFiles {
@@ -92,19 +99,25 @@ impl StaticFiles {
         let target = self.locate(safe.relative.clone()).await;
         match target.map_err(|e| io_status(&e))? {
             Target::File { file, len } => Ok(file_response(&safe.relative, file, len, head)),
-            Target::Dir if !safe.trailing_slash => {
+            Target::Dir(_) if !safe.trailing_slash => {
                 redirect_to_dir(&safe.relative, req.uri().query())
             }
-            Target::Dir => {
+            Target::Dir(dir) => {
                 let index = safe.relative.join(INDEX);
                 match self.locate(index.clone()).await {
-                    Ok(Target::File { file, len }) => Ok(file_response(&index, file, len, head)),
-                    Err(e) if io_status(&e) != StatusCode::NOT_FOUND => Err(io_status(&e)),
-                    _ if safe.relative.as_os_str().is_empty() => {
-                        Ok(html_response(pages::welcome(), head))
+                    Ok(Target::File { file, len }) => {
+                        return Ok(file_response(&index, file, len, head));
                     }
-                    // Directory listings arrive in a later step.
-                    _ => Err(StatusCode::NOT_FOUND),
+                    Err(e) if io_status(&e) != StatusCode::NOT_FOUND => return Err(io_status(&e)),
+                    _ => {}
+                }
+                if self.inner.policy.directory_listing {
+                    let page = self.listing(dir, safe.relative).await;
+                    Ok(html_response(page.map_err(|e| io_status(&e))?, head))
+                } else if safe.relative.as_os_str().is_empty() {
+                    Ok(html_response(pages::welcome(), head))
+                } else {
+                    Err(StatusCode::NOT_FOUND)
                 }
             }
         }
@@ -132,6 +145,16 @@ impl StaticFiles {
             .await
             .map_err(io::Error::other)?
     }
+
+    async fn listing(&self, dir: Dir, relative: PathBuf) -> io::Result<Bytes> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let entries = inner.list(&dir, &relative)?;
+            Ok(listing::render(&relative, entries))
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
 }
 
 impl Inner {
@@ -146,7 +169,8 @@ impl Inner {
     fn locate_follow(&self, relative: &Path) -> io::Result<Target> {
         let path = self.root.join(relative);
         if std::fs::metadata(&path)?.is_dir() {
-            return Ok(Target::Dir);
+            let dir = Dir::open_ambient_dir(&path, ambient_authority())?;
+            return Ok(Target::Dir(dir));
         }
         open_regular(std::fs::File::open(path)?)
     }
@@ -160,7 +184,7 @@ impl Inner {
         };
         let meta = self.dir.metadata(path)?;
         if meta.is_dir() {
-            return Ok(Target::Dir);
+            return Ok(Target::Dir(self.dir.open_dir(path)?));
         }
         // Checked before opening: opening a FIFO would block the thread.
         if !meta.is_file() {
@@ -173,7 +197,7 @@ impl Inner {
     fn locate_no_links(&self, relative: &Path) -> io::Result<Target> {
         let mut parts = relative.iter();
         let Some(last) = parts.next_back() else {
-            return Ok(Target::Dir);
+            return Ok(Target::Dir(self.dir.try_clone()?));
         };
         let mut dir = self.dir.try_clone()?;
         for part in parts {
@@ -189,11 +213,55 @@ impl Inner {
             return Err(io::ErrorKind::NotFound.into());
         }
         if file_type.is_dir() {
-            return Ok(Target::Dir);
+            return Ok(Target::Dir(dir.open_dir_nofollow(last)?));
         }
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No);
         open_regular(dir.open_with(last, &options)?.into_std())
+    }
+
+    /// Lists only entries a request could actually reach under the current policy.
+    fn list(&self, dir: &Dir, relative: &Path) -> io::Result<Vec<Entry>> {
+        let at_root = relative.as_os_str().is_empty();
+        let mut entries = Vec::new();
+        for entry in dir.entries()? {
+            let entry = entry?;
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if check_segment(&name, self.policy, at_root).is_err() {
+                continue;
+            }
+            let file_type = entry.file_type()?;
+            let is_dir = if file_type.is_symlink() {
+                match self.link_is_dir(relative, &name) {
+                    Some(is_dir) => is_dir,
+                    None => continue,
+                }
+            } else if file_type.is_dir() || file_type.is_file() {
+                file_type.is_dir()
+            } else {
+                continue;
+            };
+            entries.push(Entry { name, is_dir });
+        }
+        Ok(entries)
+    }
+
+    /// Whether a link leads to a directory, or `None` if the symlink policy would refuse it.
+    fn link_is_dir(&self, relative: &Path, name: &str) -> Option<bool> {
+        let (is_dir, is_file) = match self.policy.symlinks {
+            Symlinks::Deny => return None,
+            Symlinks::InsideRoot => {
+                let meta = self.dir.metadata(relative.join(name)).ok()?;
+                (meta.is_dir(), meta.is_file())
+            }
+            Symlinks::Follow => {
+                let meta = std::fs::metadata(self.root.join(relative).join(name)).ok()?;
+                (meta.is_dir(), meta.is_file())
+            }
+        };
+        (is_dir || is_file).then_some(is_dir)
     }
 }
 
@@ -201,7 +269,7 @@ impl Inner {
 fn open_regular(file: std::fs::File) -> io::Result<Target> {
     let meta = file.metadata()?;
     if meta.is_dir() {
-        Ok(Target::Dir)
+        Ok(Target::Dir(Dir::from_std_file(file)))
     } else if meta.is_file() {
         Ok(Target::File {
             file: File::from_std(file),
