@@ -23,6 +23,8 @@ http-body-util = "0.1.5"
 httpdate = "1.0.3"
 mime_guess = { version = "2.0.5", default-features = false }
 percent-encoding = "2.3.2"
+serde = { version = "1.0.229", features = ["derive"] }
 tempfile = "3.27.0"
 tokio = "1.53.3"
 tokio-util = "0.7.20"
+toml = "1.1.8"
