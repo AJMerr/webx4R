@@ -7,19 +7,12 @@ use http::StatusCode;
 
 /// Shown at a site's root when it has no `index.html`.
 pub fn welcome() -> Bytes {
-    render(
-        "webx4R is online",
-        "add an index.html to this site's root to replace this page",
-    )
+    render("webx4R is online", "add an index.html to this site's root to replace this page")
 }
 
 /// The default page for an error status.
 pub fn error(code: StatusCode) -> Bytes {
-    let title = format!(
-        "{} {}",
-        code.as_u16(),
-        code.canonical_reason().unwrap_or("Error")
-    );
+    let title = format!("{} {}", code.as_u16(), code.canonical_reason().unwrap_or("Error"));
     render(&title, message(code))
 }
 
@@ -32,6 +25,8 @@ fn message(code: StatusCode) -> &'static str {
         StatusCode::METHOD_NOT_ALLOWED => {
             "the request method is recognized by the server, but not supported by the target resource"
         }
+        StatusCode::PRECONDITION_FAILED => "a condition in the request was not met",
+        StatusCode::RANGE_NOT_SATISFIABLE => "the requested range is outside the file",
         StatusCode::INTERNAL_SERVER_ERROR => "the server encountered an unexpected error",
         StatusCode::BAD_GATEWAY => "the server got an invalid response from an upstream server",
         StatusCode::SERVICE_UNAVAILABLE => "the server is temporarily unable to handle the request",

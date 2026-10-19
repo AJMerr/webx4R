@@ -23,10 +23,7 @@ const OVERRIDES: &[(&str, &str)] = &[
 
 /// Returns the MIME type for `path`, without parameters.
 pub fn mime_type(path: &Path) -> &'static str {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .and_then(lookup)
-        .unwrap_or(OCTET_STREAM)
+    path.extension().and_then(|ext| ext.to_str()).and_then(lookup).unwrap_or(OCTET_STREAM)
 }
 
 /// Returns the `Content-Type` header value for `path`; `text/*` types get `charset=utf-8`.
@@ -53,9 +50,7 @@ fn lookup(ext: &str) -> Option<&'static str> {
 }
 
 fn cmp_ignore_ascii_case(a: &str, b: &str) -> Ordering {
-    a.bytes()
-        .map(|c| c.to_ascii_lowercase())
-        .cmp(b.bytes().map(|c| c.to_ascii_lowercase()))
+    a.bytes().map(|c| c.to_ascii_lowercase()).cmp(b.bytes().map(|c| c.to_ascii_lowercase()))
 }
 
 #[cfg(test)]
@@ -112,10 +107,7 @@ mod tests {
 
     #[test]
     fn text_types_get_utf8_charset() {
-        assert_eq!(
-            content_type(Path::new("a.html")),
-            "text/html; charset=utf-8"
-        );
+        assert_eq!(content_type(Path::new("a.html")), "text/html; charset=utf-8");
         assert_eq!(content_type(Path::new("a.png")), "image/png");
     }
 

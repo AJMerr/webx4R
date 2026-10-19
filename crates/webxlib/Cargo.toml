@@ -12,8 +12,10 @@ bytes.workspace = true
 cap-fs-ext.workspace = true
 cap-std.workspace = true
 futures-core.workspace = true
+futures-util.workspace = true
 http.workspace = true
 http-body.workspace = true
+httpdate.workspace = true
 mime_guess.workspace = true
 percent-encoding.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "rt"] }

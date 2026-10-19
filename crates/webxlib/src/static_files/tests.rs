@@ -26,6 +26,7 @@ impl Site {
         fs::create_dir(dir.path().join("outside")).unwrap();
         fs::write(root.join("index.html"), "<h1>home</h1>").unwrap();
         fs::write(root.join("style.css"), "body{}").unwrap();
+        fs::write(root.join("digits.txt"), "0123456789").unwrap();
         fs::write(root.join("docs/index.html"), "docs").unwrap();
         fs::write(root.join(".env"), "SECRET").unwrap();
         fs::write(root.join(".well-known/security.txt"), "contact").unwrap();
@@ -33,10 +34,23 @@ impl Site {
         Self { dir }
     }
 
-    async fn request(&self, method: Method, uri: &str, policy: PathPolicy) -> Response<Body> {
+    async fn send(&self, req: Request<()>, policy: PathPolicy) -> Response<Body> {
         let server = StaticFiles::new(self.dir.path().join("www"), policy).unwrap();
-        let req = Request::builder().method(method).uri(uri).body(()).unwrap();
         server.serve(&req).await
+    }
+
+    async fn request(&self, method: Method, uri: &str, policy: PathPolicy) -> Response<Body> {
+        let req = Request::builder().method(method).uri(uri).body(()).unwrap();
+        self.send(req, policy).await
+    }
+
+    async fn get_headers(&self, uri: &str, headers: &[(HeaderName, &str)]) -> Response<Body> {
+        let mut req = Request::builder().uri(uri);
+        for (name, value) in headers {
+            req = req.header(name, *value);
+        }
+        let req = req.body(()).unwrap();
+        self.send(req, PathPolicy::default()).await
     }
 
     async fn get(&self, uri: &str) -> Response<Body> {
@@ -76,9 +90,7 @@ async fn file_with_content_type() {
 #[tokio::test]
 async fn head_has_headers_but_no_body() {
     let site = Site::new();
-    let res = site
-        .request(Method::HEAD, "/style.css", PathPolicy::default())
-        .await;
+    let res = site.request(Method::HEAD, "/style.css", PathPolicy::default()).await;
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(header(&res, CONTENT_LENGTH), "6");
     assert!(body(res).await.is_empty());
@@ -194,9 +206,7 @@ mod pages {
     #[tokio::test]
     async fn head_error_has_length_but_no_body() {
         let site = Site::new();
-        let res = site
-            .request(Method::HEAD, "/missing.html", PathPolicy::default())
-            .await;
+        let res = site.request(Method::HEAD, "/missing.html", PathPolicy::default()).await;
         let expected = crate::pages::error(StatusCode::NOT_FOUND).len().to_string();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         assert_eq!(header(&res, CONTENT_LENGTH), expected);
@@ -210,6 +220,168 @@ mod pages {
         let res = site.request(Method::DELETE, "/", policy).await;
         assert_eq!(header(&res, ALLOW), "GET, HEAD");
         assert!(text(body(res).await).contains("405 Method Not Allowed"));
+    }
+}
+
+mod conditional_requests {
+    use http::header::{ETAG, IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
+
+    use super::*;
+
+    async fn etag_of(site: &Site, uri: &str) -> String {
+        header(&site.get(uri).await, ETAG).to_owned()
+    }
+
+    #[tokio::test]
+    async fn files_carry_validators() {
+        let res = Site::new().get("/style.css").await;
+        assert!(header(&res, ETAG).starts_with('"'));
+        assert!(httpdate::parse_http_date(header(&res, LAST_MODIFIED)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn index_html_carries_validators_but_error_pages_do_not() {
+        let site = Site::new();
+        assert!(site.get("/").await.headers().contains_key(ETAG));
+        assert!(!site.get("/missing.html").await.headers().contains_key(ETAG));
+    }
+
+    #[tokio::test]
+    async fn matching_etag_is_not_modified() {
+        let site = Site::new();
+        let etag = etag_of(&site, "/style.css").await;
+        let headers = [(IF_NONE_MATCH, etag.as_str())];
+        let res = site.get_headers("/style.css", &headers).await;
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(header(&res, ETAG), etag);
+        assert!(body(res).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_etag_gets_the_full_file() {
+        let site = Site::new();
+        let headers = [(IF_NONE_MATCH, "\"old\"")];
+        let res = site.get_headers("/style.css", &headers).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body(res).await, "body{}");
+    }
+
+    #[tokio::test]
+    async fn unchanged_since_last_modified_is_not_modified() {
+        let site = Site::new();
+        let res = site.get("/style.css").await;
+        let last_modified = header(&res, LAST_MODIFIED).to_owned();
+        let headers = [(IF_MODIFIED_SINCE, last_modified.as_str())];
+        let res = site.get_headers("/style.css", &headers).await;
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn failed_if_match_is_precondition_failed() {
+        let site = Site::new();
+        let headers = [(IF_MATCH, "\"nope\"")];
+        let res = site.get_headers("/style.css", &headers).await;
+        assert_eq!(res.status(), StatusCode::PRECONDITION_FAILED);
+        let page = String::from_utf8(body(res).await.to_vec()).unwrap();
+        assert!(page.contains("412 Precondition Failed"));
+    }
+}
+
+mod ranges {
+    use http::header::{ACCEPT_RANGES, CONTENT_RANGE, ETAG, IF_NONE_MATCH, IF_RANGE, RANGE};
+
+    use super::*;
+
+    async fn get_range(site: &Site, range: &str) -> Response<Body> {
+        site.get_headers("/digits.txt", &[(RANGE, range)]).await
+    }
+
+    #[tokio::test]
+    async fn full_responses_advertise_ranges() {
+        let res = Site::new().get("/digits.txt").await;
+        assert_eq!(header(&res, ACCEPT_RANGES), "bytes");
+    }
+
+    #[tokio::test]
+    async fn single_range_is_partial_content() {
+        let res = get_range(&Site::new(), "bytes=2-5").await;
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(header(&res, CONTENT_RANGE), "bytes 2-5/10");
+        assert_eq!(header(&res, CONTENT_LENGTH), "4");
+        assert_eq!(header(&res, CONTENT_TYPE), "text/plain; charset=utf-8");
+        assert_eq!(body(res).await, "2345");
+    }
+
+    #[tokio::test]
+    async fn suffix_range_is_the_tail() {
+        let res = get_range(&Site::new(), "bytes=-3").await;
+        assert_eq!(header(&res, CONTENT_RANGE), "bytes 7-9/10");
+        assert_eq!(body(res).await, "789");
+    }
+
+    #[tokio::test]
+    async fn range_past_the_end_is_not_satisfiable() {
+        let res = get_range(&Site::new(), "bytes=50-60").await;
+        assert_eq!(res.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(header(&res, CONTENT_RANGE), "bytes */10");
+    }
+
+    #[tokio::test]
+    async fn malformed_range_gets_the_full_file() {
+        let res = get_range(&Site::new(), "bytes=9-2").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body(res).await, "0123456789");
+    }
+
+    #[tokio::test]
+    async fn head_ignores_range() {
+        let site = Site::new();
+        let req = Request::head("/digits.txt").header(RANGE, "bytes=0-1").body(()).unwrap();
+        let res = site.send(req, PathPolicy::default()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(header(&res, CONTENT_LENGTH), "10");
+    }
+
+    #[tokio::test]
+    async fn if_range_with_current_etag_is_honored() {
+        let site = Site::new();
+        let etag = header(&site.get("/digits.txt").await, ETAG).to_owned();
+        let headers = [(RANGE, "bytes=0-1"), (IF_RANGE, etag.as_str())];
+        let res = site.get_headers("/digits.txt", &headers).await;
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body(res).await, "01");
+    }
+
+    #[tokio::test]
+    async fn if_range_with_stale_etag_gets_the_full_file() {
+        let headers = [(RANGE, "bytes=0-1"), (IF_RANGE, "\"old\"")];
+        let res = Site::new().get_headers("/digits.txt", &headers).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body(res).await, "0123456789");
+    }
+
+    #[tokio::test]
+    async fn not_modified_takes_precedence_over_range() {
+        let site = Site::new();
+        let etag = header(&site.get("/digits.txt").await, ETAG).to_owned();
+        let headers = [(RANGE, "bytes=0-1"), (IF_NONE_MATCH, etag.as_str())];
+        let res = site.get_headers("/digits.txt", &headers).await;
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn multiple_ranges_are_multipart() {
+        let res = get_range(&Site::new(), "bytes=0-1, 5-6").await;
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        let content_type = header(&res, CONTENT_TYPE).to_owned();
+        let boundary = content_type.strip_prefix("multipart/byteranges; boundary=").unwrap();
+        let expected = format!(
+            "\r\n--{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Range: bytes 0-1/10\r\n\r\n01\
+             \r\n--{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Range: bytes 5-6/10\r\n\r\n56\
+             \r\n--{boundary}--\r\n"
+        );
+        assert_eq!(header(&res, CONTENT_LENGTH), expected.len().to_string());
+        assert_eq!(body(res).await, expected);
     }
 }
 
@@ -291,10 +463,7 @@ mod symlinks {
     }
 
     async fn get_with(site: &Site, uri: &str, symlinks: Symlinks) -> Response<Body> {
-        let policy = PathPolicy {
-            symlinks,
-            ..PathPolicy::default()
-        };
+        let policy = PathPolicy { symlinks, ..PathPolicy::default() };
         site.request(Method::GET, uri, policy).await
     }
 
@@ -336,11 +505,7 @@ mod symlinks {
 
     async fn root_listing(site: &Site, symlinks: Symlinks) -> String {
         fs::remove_file(site.dir.path().join("www/index.html")).unwrap();
-        let policy = PathPolicy {
-            symlinks,
-            directory_listing: true,
-            ..PathPolicy::default()
-        };
+        let policy = PathPolicy { symlinks, directory_listing: true, ..PathPolicy::default() };
         let res = site.request(Method::GET, "/", policy).await;
         String::from_utf8(body(res).await.to_vec()).unwrap()
     }

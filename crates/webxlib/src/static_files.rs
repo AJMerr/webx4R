@@ -1,29 +1,37 @@
 //! Serves files from a site root, following the original webxlib's behavior.
 
+mod conditional;
 mod listing;
 mod path;
+mod range;
 #[cfg(test)]
 mod tests;
 
-use std::io;
+use std::io::{self, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use bytes::Bytes;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
-use http::header::{ALLOW, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
+use http::header::{
+    ACCEPT_RANGES, ALLOW, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE,
+};
 use http::{HeaderValue, Method, Request, Response, StatusCode};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use tokio::fs::File;
+use tokio::io::AsyncSeekExt;
 
 use crate::body::Body;
 use crate::{mime, pages};
 
+use conditional::{Precondition, Validators};
 use listing::Entry;
 use path::check_segment;
 pub use path::{PathError, PathPolicy, SafePath, Symlinks, sanitize};
+use range::{ByteRange, RangePlan};
 
 /// Served when a directory is requested with a trailing slash.
 const INDEX: &str = "index.html";
@@ -61,12 +69,16 @@ struct Inner {
 
 /// What a sanitized path refers to.
 enum Target {
-    File {
-        file: File,
-        len: u64,
-    },
+    File(OpenFile),
     /// An open handle, so later reads use the directory that passed the policy checks.
     Dir(Dir),
+}
+
+/// A regular file, with metadata read from its open handle.
+struct OpenFile {
+    file: File,
+    len: u64,
+    modified: Option<SystemTime>,
 }
 
 impl StaticFiles {
@@ -74,9 +86,7 @@ impl StaticFiles {
     pub fn new(root: impl AsRef<Path>, policy: PathPolicy) -> io::Result<Self> {
         let root = std::fs::canonicalize(root)?;
         let dir = Dir::open_ambient_dir(&root, ambient_authority())?;
-        Ok(Self {
-            inner: Arc::new(Inner { dir, root, policy }),
-        })
+        Ok(Self { inner: Arc::new(Inner { dir, root, policy }) })
     }
 
     pub async fn serve<B>(&self, req: &Request<B>) -> Response<Body> {
@@ -98,16 +108,14 @@ impl StaticFiles {
 
         let target = self.locate(safe.relative.clone()).await;
         match target.map_err(|e| io_status(&e))? {
-            Target::File { file, len } => Ok(file_response(&safe.relative, file, len, head)),
+            Target::File(open) => serve_file(req, &safe.relative, open, head).await,
             Target::Dir(_) if !safe.trailing_slash => {
                 redirect_to_dir(&safe.relative, req.uri().query())
             }
             Target::Dir(dir) => {
                 let index = safe.relative.join(INDEX);
                 match self.locate(index.clone()).await {
-                    Ok(Target::File { file, len }) => {
-                        return Ok(file_response(&index, file, len, head));
-                    }
+                    Ok(Target::File(open)) => return serve_file(req, &index, open, head).await,
                     Err(e) if io_status(&e) != StatusCode::NOT_FOUND => return Err(io_status(&e)),
                     _ => {}
                 }
@@ -127,13 +135,12 @@ impl StaticFiles {
     async fn error_response(&self, code: StatusCode, head: bool) -> Response<Body> {
         let custom = PathBuf::from(format!("{}.html", code.as_u16()));
         let mut res = match self.locate(custom.clone()).await {
-            Ok(Target::File { file, len }) => file_response(&custom, file, len, head),
+            Ok(Target::File(open)) => file_response(&custom, open, head),
             _ => html_response(pages::error(code), head),
         };
         *res.status_mut() = code;
         if code == StatusCode::METHOD_NOT_ALLOWED {
-            res.headers_mut()
-                .insert(ALLOW, HeaderValue::from_static("GET, HEAD"));
+            res.headers_mut().insert(ALLOW, HeaderValue::from_static("GET, HEAD"));
         }
         res
     }
@@ -177,11 +184,7 @@ impl Inner {
 
     /// The open is sandboxed, so a link swapped after the metadata check still can't escape.
     fn locate_inside_root(&self, relative: &Path) -> io::Result<Target> {
-        let path = if relative.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            relative
-        };
+        let path = if relative.as_os_str().is_empty() { Path::new(".") } else { relative };
         let meta = self.dir.metadata(path)?;
         if meta.is_dir() {
             return Ok(Target::Dir(self.dir.open_dir(path)?));
@@ -271,10 +274,11 @@ fn open_regular(file: std::fs::File) -> io::Result<Target> {
     if meta.is_dir() {
         Ok(Target::Dir(Dir::from_std_file(file)))
     } else if meta.is_file() {
-        Ok(Target::File {
+        Ok(Target::File(OpenFile {
             file: File::from_std(file),
             len: meta.len(),
-        })
+            modified: meta.modified().ok(),
+        }))
     } else {
         Err(io::ErrorKind::NotFound.into())
     }
@@ -291,29 +295,106 @@ fn hide_escape(e: io::Error) -> io::Error {
 }
 
 /// `name` picks the content type, so a link is typed by its own name rather than its target's.
-fn file_response(name: &Path, file: File, len: u64, head: bool) -> Response<Body> {
-    let body = if head {
-        Body::empty()
-    } else {
-        Body::file(file, len)
+/// A full or partial file response with validators, or 304/412/416 when the request calls for it.
+async fn serve_file<B>(
+    req: &Request<B>,
+    name: &Path,
+    open: OpenFile,
+    head: bool,
+) -> Result<Response<Body>, StatusCode> {
+    let validators = Validators::new(open.len, open.modified);
+    let mut res = match conditional::evaluate(req.headers(), &validators) {
+        Precondition::Failed => return Err(StatusCode::PRECONDITION_FAILED),
+        Precondition::NotModified => {
+            let mut res = Response::new(Body::empty());
+            *res.status_mut() = StatusCode::NOT_MODIFIED;
+            res
+        }
+        Precondition::Proceed => match requested_ranges(req, &validators, open.len) {
+            RangePlan::Full => file_response(name, open, head),
+            RangePlan::Partial(ranges) => {
+                partial_response(name, open, &ranges).await.map_err(|e| io_status(&e))?
+            }
+            RangePlan::Unsatisfiable => range_not_satisfiable(open.len),
+        },
     };
-    let content_type = HeaderValue::from_str(&mime::content_type(name))
-        .unwrap_or(HeaderValue::from_static(mime::OCTET_STREAM));
+    validators.insert_into(res.headers_mut());
+    res.headers_mut().insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    Ok(res)
+}
 
+/// Range is defined only for GET, and only while `If-Range` still names this version.
+fn requested_ranges<B>(req: &Request<B>, validators: &Validators, len: u64) -> RangePlan {
+    let header = req.headers().get(RANGE).and_then(|v| v.to_str().ok());
+    match header {
+        Some(header)
+            if req.method() == Method::GET
+                && conditional::if_range_matches(req.headers(), validators) =>
+        {
+            range::plan(header, len)
+        }
+        _ => RangePlan::Full,
+    }
+}
+
+async fn partial_response(
+    name: &Path,
+    open: OpenFile,
+    ranges: &[ByteRange],
+) -> io::Result<Response<Body>> {
+    let OpenFile { mut file, len: total, .. } = open;
+    let mut res = if let [range] = ranges {
+        let content_range = HeaderValue::try_from(range.content_range(total));
+        let content_range = content_range.map_err(io::Error::other)?;
+        file.seek(SeekFrom::Start(range.start)).await?;
+        let mut res = Response::new(Body::file(file, range.len()));
+        let headers = res.headers_mut();
+        headers.insert(CONTENT_TYPE, content_type(name));
+        headers.insert(CONTENT_LENGTH, HeaderValue::from(range.len()));
+        headers.insert(CONTENT_RANGE, content_range);
+        res
+    } else {
+        let part_type = mime::content_type(name);
+        let (multipart_type, len, stream) = range::multipart(file, &part_type, ranges, total);
+        let multipart_type = HeaderValue::try_from(multipart_type).map_err(io::Error::other)?;
+        let mut res = Response::new(Body::stream(stream, len));
+        let headers = res.headers_mut();
+        headers.insert(CONTENT_TYPE, multipart_type);
+        headers.insert(CONTENT_LENGTH, HeaderValue::from(len));
+        res
+    };
+    *res.status_mut() = StatusCode::PARTIAL_CONTENT;
+    Ok(res)
+}
+
+fn range_not_satisfiable(len: u64) -> Response<Body> {
+    let code = StatusCode::RANGE_NOT_SATISFIABLE;
+    let mut res = html_response(pages::error(code), false);
+    *res.status_mut() = code;
+    if let Ok(value) = HeaderValue::try_from(format!("bytes */{len}")) {
+        res.headers_mut().insert(CONTENT_RANGE, value);
+    }
+    res
+}
+
+fn file_response(name: &Path, open: OpenFile, head: bool) -> Response<Body> {
+    let OpenFile { file, len, .. } = open;
+    let body = if head { Body::empty() } else { Body::file(file, len) };
     let mut res = Response::new(body);
     let headers = res.headers_mut();
-    headers.insert(CONTENT_TYPE, content_type);
+    headers.insert(CONTENT_TYPE, content_type(name));
     headers.insert(CONTENT_LENGTH, HeaderValue::from(len));
     res
 }
 
+fn content_type(name: &Path) -> HeaderValue {
+    HeaderValue::from_str(&mime::content_type(name))
+        .unwrap_or(HeaderValue::from_static(mime::OCTET_STREAM))
+}
+
 fn html_response(page: Bytes, head: bool) -> Response<Body> {
     let len = page.len();
-    let body = if head {
-        Body::empty()
-    } else {
-        Body::bytes(page)
-    };
+    let body = if head { Body::empty() } else { Body::bytes(page) };
 
     let mut res = Response::new(body);
     let headers = res.headers_mut();
