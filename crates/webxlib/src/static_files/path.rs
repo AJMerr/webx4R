@@ -4,11 +4,24 @@ use std::path::PathBuf;
 
 use percent_encoding::percent_decode_str;
 
-/// Controls which request paths [`sanitize`] accepts.
+/// Controls which request paths are served.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PathPolicy {
     /// Allow segments starting with `.`; a leading `/.well-known/` is always allowed.
     pub allow_dotfiles: bool,
+    pub symlinks: Symlinks,
+}
+
+/// How symlinks inside a site root are treated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Symlinks {
+    /// Follow every link, wherever it points.
+    Follow,
+    /// Follow links whose target is inside the site root.
+    #[default]
+    InsideRoot,
+    /// Refuse any path that goes through a link.
+    Deny,
 }
 
 /// A request path that is safe to join onto a site root.
@@ -95,9 +108,11 @@ mod tests {
 
     const DENY: PathPolicy = PathPolicy {
         allow_dotfiles: false,
+        symlinks: Symlinks::InsideRoot,
     };
     const ALLOW: PathPolicy = PathPolicy {
         allow_dotfiles: true,
+        symlinks: Symlinks::InsideRoot,
     };
 
     fn ok(path: &str) -> SafePath {

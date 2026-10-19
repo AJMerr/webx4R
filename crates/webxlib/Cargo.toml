@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 bytes.workspace = true
 futures-core.workspace = true
+http.workspace = true
 http-body.workspace = true
 mime_guess.workspace = true
 percent-encoding.workspace = true

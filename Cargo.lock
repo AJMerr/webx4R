@@ -272,6 +272,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "futures-core",
+ "http",
  "http-body",
  "http-body-util",
  "mime_guess",
