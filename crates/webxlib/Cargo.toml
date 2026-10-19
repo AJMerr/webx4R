@@ -8,5 +8,15 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+bytes.workspace = true
+futures-core.workspace = true
+http-body.workspace = true
 mime_guess.workspace = true
 percent-encoding.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
+tokio-util = { workspace = true, features = ["io"] }
+
+[dev-dependencies]
+http-body-util.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
