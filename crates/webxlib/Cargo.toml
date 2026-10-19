@@ -12,6 +12,7 @@ bytes.workspace = true
 cap-fs-ext.workspace = true
 cap-std.workspace = true
 futures-core.workspace = true
+futures-util.workspace = true
 http.workspace = true
 http-body.workspace = true
 httpdate.workspace = true

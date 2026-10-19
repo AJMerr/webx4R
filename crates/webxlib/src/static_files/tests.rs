@@ -26,6 +26,7 @@ impl Site {
         fs::create_dir(dir.path().join("outside")).unwrap();
         fs::write(root.join("index.html"), "<h1>home</h1>").unwrap();
         fs::write(root.join("style.css"), "body{}").unwrap();
+        fs::write(root.join("digits.txt"), "0123456789").unwrap();
         fs::write(root.join("docs/index.html"), "docs").unwrap();
         fs::write(root.join(".env"), "SECRET").unwrap();
         fs::write(root.join(".well-known/security.txt"), "contact").unwrap();
@@ -283,6 +284,104 @@ mod conditional_requests {
         assert_eq!(res.status(), StatusCode::PRECONDITION_FAILED);
         let page = String::from_utf8(body(res).await.to_vec()).unwrap();
         assert!(page.contains("412 Precondition Failed"));
+    }
+}
+
+mod ranges {
+    use http::header::{ACCEPT_RANGES, CONTENT_RANGE, ETAG, IF_NONE_MATCH, IF_RANGE, RANGE};
+
+    use super::*;
+
+    async fn get_range(site: &Site, range: &str) -> Response<Body> {
+        site.get_headers("/digits.txt", &[(RANGE, range)]).await
+    }
+
+    #[tokio::test]
+    async fn full_responses_advertise_ranges() {
+        let res = Site::new().get("/digits.txt").await;
+        assert_eq!(header(&res, ACCEPT_RANGES), "bytes");
+    }
+
+    #[tokio::test]
+    async fn single_range_is_partial_content() {
+        let res = get_range(&Site::new(), "bytes=2-5").await;
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(header(&res, CONTENT_RANGE), "bytes 2-5/10");
+        assert_eq!(header(&res, CONTENT_LENGTH), "4");
+        assert_eq!(header(&res, CONTENT_TYPE), "text/plain; charset=utf-8");
+        assert_eq!(body(res).await, "2345");
+    }
+
+    #[tokio::test]
+    async fn suffix_range_is_the_tail() {
+        let res = get_range(&Site::new(), "bytes=-3").await;
+        assert_eq!(header(&res, CONTENT_RANGE), "bytes 7-9/10");
+        assert_eq!(body(res).await, "789");
+    }
+
+    #[tokio::test]
+    async fn range_past_the_end_is_not_satisfiable() {
+        let res = get_range(&Site::new(), "bytes=50-60").await;
+        assert_eq!(res.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(header(&res, CONTENT_RANGE), "bytes */10");
+    }
+
+    #[tokio::test]
+    async fn malformed_range_gets_the_full_file() {
+        let res = get_range(&Site::new(), "bytes=9-2").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body(res).await, "0123456789");
+    }
+
+    #[tokio::test]
+    async fn head_ignores_range() {
+        let site = Site::new();
+        let req = Request::head("/digits.txt").header(RANGE, "bytes=0-1").body(()).unwrap();
+        let res = site.send(req, PathPolicy::default()).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(header(&res, CONTENT_LENGTH), "10");
+    }
+
+    #[tokio::test]
+    async fn if_range_with_current_etag_is_honored() {
+        let site = Site::new();
+        let etag = header(&site.get("/digits.txt").await, ETAG).to_owned();
+        let headers = [(RANGE, "bytes=0-1"), (IF_RANGE, etag.as_str())];
+        let res = site.get_headers("/digits.txt", &headers).await;
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(body(res).await, "01");
+    }
+
+    #[tokio::test]
+    async fn if_range_with_stale_etag_gets_the_full_file() {
+        let headers = [(RANGE, "bytes=0-1"), (IF_RANGE, "\"old\"")];
+        let res = Site::new().get_headers("/digits.txt", &headers).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body(res).await, "0123456789");
+    }
+
+    #[tokio::test]
+    async fn not_modified_takes_precedence_over_range() {
+        let site = Site::new();
+        let etag = header(&site.get("/digits.txt").await, ETAG).to_owned();
+        let headers = [(RANGE, "bytes=0-1"), (IF_NONE_MATCH, etag.as_str())];
+        let res = site.get_headers("/digits.txt", &headers).await;
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn multiple_ranges_are_multipart() {
+        let res = get_range(&Site::new(), "bytes=0-1, 5-6").await;
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        let content_type = header(&res, CONTENT_TYPE).to_owned();
+        let boundary = content_type.strip_prefix("multipart/byteranges; boundary=").unwrap();
+        let expected = format!(
+            "\r\n--{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Range: bytes 0-1/10\r\n\r\n01\
+             \r\n--{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Range: bytes 5-6/10\r\n\r\n56\
+             \r\n--{boundary}--\r\n"
+        );
+        assert_eq!(header(&res, CONTENT_LENGTH), expected.len().to_string());
+        assert_eq!(body(res).await, expected);
     }
 }
 

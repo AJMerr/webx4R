@@ -1,4 +1,4 @@
-//! Response body: empty, in-memory bytes, or a file streamed from disk.
+//! Response body: empty, in-memory bytes, a file streamed from disk, or any stream of known length.
 
 use std::io;
 use std::pin::Pin;
@@ -17,10 +17,13 @@ const FILE_CHUNK: usize = 64 * 1024;
 /// An [`http_body::Body`] with an exact size known up front.
 pub struct Body(Kind);
 
+type BoxStream = Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>;
+
 enum Kind {
     Empty,
     Bytes(Option<Bytes>),
     File { stream: ReaderStream<Take<File>>, remaining: u64 },
+    Stream { stream: BoxStream, remaining: u64 },
 }
 
 impl Body {
@@ -43,6 +46,14 @@ impl Body {
             remaining: len,
         })
     }
+
+    /// Streams exactly `len` bytes from `stream`; yielding fewer or more is an error.
+    pub fn stream(
+        stream: impl Stream<Item = io::Result<Bytes>> + Send + 'static,
+        len: u64,
+    ) -> Self {
+        Self(Kind::Stream { stream: Box::pin(stream), remaining: len })
+    }
 }
 
 impl http_body::Body for Body {
@@ -56,20 +67,8 @@ impl http_body::Body for Body {
         match &mut self.get_mut().0 {
             Kind::Empty => Poll::Ready(None),
             Kind::Bytes(bytes) => Poll::Ready(bytes.take().map(|b| Ok(Frame::data(b)))),
-            Kind::File { stream, remaining } => match Pin::new(stream).poll_next(cx) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(Some(Ok(chunk))) => {
-                    *remaining -= chunk.len() as u64;
-                    Poll::Ready(Some(Ok(Frame::data(chunk))))
-                }
-                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
-                // The file shrank mid-response; fail rather than send fewer bytes than promised.
-                Poll::Ready(None) if *remaining > 0 => {
-                    *remaining = 0;
-                    Poll::Ready(Some(Err(io::ErrorKind::UnexpectedEof.into())))
-                }
-                Poll::Ready(None) => Poll::Ready(None),
-            },
+            Kind::File { stream, remaining } => poll_sized(Pin::new(stream), remaining, cx),
+            Kind::Stream { stream, remaining } => poll_sized(stream.as_mut(), remaining, cx),
         }
     }
 
@@ -77,7 +76,7 @@ impl http_body::Body for Body {
         match &self.0 {
             Kind::Empty => true,
             Kind::Bytes(bytes) => bytes.is_none(),
-            Kind::File { remaining, .. } => *remaining == 0,
+            Kind::File { remaining, .. } | Kind::Stream { remaining, .. } => *remaining == 0,
         }
     }
 
@@ -87,8 +86,39 @@ impl http_body::Body for Body {
             Kind::Bytes(bytes) => {
                 SizeHint::with_exact(bytes.as_ref().map_or(0, |b| b.len() as u64))
             }
-            Kind::File { remaining, .. } => SizeHint::with_exact(*remaining),
+            Kind::File { remaining, .. } | Kind::Stream { remaining, .. } => {
+                SizeHint::with_exact(*remaining)
+            }
         }
+    }
+}
+
+/// Polls `stream` while holding it to exactly `remaining` bytes.
+fn poll_sized<S: Stream<Item = io::Result<Bytes>> + ?Sized>(
+    stream: Pin<&mut S>,
+    remaining: &mut u64,
+    cx: &mut Context<'_>,
+) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+    match stream.poll_next(cx) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Some(Ok(chunk))) => match remaining.checked_sub(chunk.len() as u64) {
+            Some(left) => {
+                *remaining = left;
+                Poll::Ready(Some(Ok(Frame::data(chunk))))
+            }
+            None => {
+                *remaining = 0;
+                let e = io::Error::new(io::ErrorKind::InvalidData, "body longer than declared");
+                Poll::Ready(Some(Err(e)))
+            }
+        },
+        Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+        // The source shrank mid-response; fail rather than send fewer bytes than promised.
+        Poll::Ready(None) if *remaining > 0 => {
+            *remaining = 0;
+            Poll::Ready(Some(Err(io::ErrorKind::UnexpectedEof.into())))
+        }
+        Poll::Ready(None) => Poll::Ready(None),
     }
 }
 
@@ -145,5 +175,29 @@ mod tests {
         let (_tmp, file) = file_with(b"short").await;
         let err = Body::file(file, 100).collect().await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    fn chunks(parts: &[&'static str]) -> impl Stream<Item = io::Result<Bytes>> + Send + use<> {
+        let parts: Vec<_> = parts.iter().map(|p| Ok(Bytes::from_static(p.as_bytes()))).collect();
+        futures_util::stream::iter(parts)
+    }
+
+    #[tokio::test]
+    async fn stream_body_with_exact_length() {
+        let body = Body::stream(chunks(&["ab", "cd"]), 4);
+        assert_eq!(body.size_hint().exact(), Some(4));
+        assert_eq!(body.collect().await.unwrap().to_bytes(), "abcd");
+    }
+
+    #[tokio::test]
+    async fn stream_shorter_than_len_is_an_error() {
+        let err = Body::stream(chunks(&["ab"]), 4).collect().await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn stream_longer_than_len_is_an_error() {
+        let err = Body::stream(chunks(&["ab", "cd"]), 3).collect().await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

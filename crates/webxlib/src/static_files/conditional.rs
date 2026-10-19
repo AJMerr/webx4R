@@ -3,7 +3,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use http::header::{
-    ETAG, HeaderName, IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE,
+    ETAG, HeaderName, IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, IF_UNMODIFIED_SINCE,
     LAST_MODIFIED,
 };
 use http::{HeaderMap, HeaderValue};
@@ -72,6 +72,24 @@ pub(super) fn evaluate(headers: &HeaderMap, validators: &Validators) -> Precondi
         return Precondition::NotModified;
     }
     Precondition::Proceed
+}
+
+/// Whether a `Range` may be honored: true without `If-Range`, otherwise only if it names
+/// this exact version. Weak tags never match, since parts must splice byte-for-byte.
+pub(super) fn if_range_matches(headers: &HeaderMap, validators: &Validators) -> bool {
+    let Some(value) = headers.get(IF_RANGE) else {
+        return true;
+    };
+    let Ok(value) = value.to_str().map(str::trim) else {
+        return false;
+    };
+    if value.starts_with('"') {
+        validators.etag.as_deref() == Some(value)
+    } else if value.starts_with("W/") {
+        false
+    } else {
+        httpdate::parse_http_date(value).is_ok_and(|date| validators.last_modified == Some(date))
+    }
 }
 
 /// `*` matches any existing file; `strong` rejects weak tags, as `If-Match` requires.
@@ -217,6 +235,22 @@ mod tests {
         let same = http_date(MODIFIED_SECS);
         assert_eq!(eval(&[(IF_UNMODIFIED_SINCE, &earlier)]), Failed);
         assert_eq!(eval(&[(IF_UNMODIFIED_SINCE, &same)]), Proceed);
+    }
+
+    #[test]
+    fn if_range_needs_this_exact_version() {
+        let range_if = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(IF_RANGE, HeaderValue::from_str(value).unwrap());
+            if_range_matches(&headers, &validators())
+        };
+        assert!(if_range_matches(&HeaderMap::new(), &validators()));
+        assert!(range_if(&etag()));
+        assert!(range_if(&http_date(MODIFIED_SECS)));
+        assert!(!range_if(&format!("W/{}", etag())));
+        assert!(!range_if("\"other\""));
+        assert!(!range_if(&http_date(MODIFIED_SECS + 1)));
+        assert!(!range_if("garbage"));
     }
 
     #[test]
