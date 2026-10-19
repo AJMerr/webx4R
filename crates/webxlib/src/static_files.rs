@@ -8,6 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
@@ -17,12 +18,14 @@ use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use tokio::fs::File;
 
 use crate::body::Body;
-use crate::mime;
+use crate::{mime, pages};
 
 pub use path::{PathError, PathPolicy, SafePath, Symlinks, sanitize};
 
 /// Served when a directory is requested with a trailing slash.
 const INDEX: &str = "index.html";
+
+const HTML: &str = "text/html; charset=utf-8";
 
 /// Characters escaped when rebuilding a path segment for a `Location` header.
 const SEGMENT: &AsciiSet = &CONTROLS
@@ -70,35 +73,56 @@ impl StaticFiles {
     }
 
     pub async fn serve<B>(&self, req: &Request<B>) -> Response<Body> {
-        let head = match *req.method() {
-            Method::GET => false,
-            Method::HEAD => true,
-            _ => return method_not_allowed(),
-        };
-        let safe = match sanitize(req.uri().path(), self.inner.policy) {
-            Ok(safe) => safe,
-            Err(PathError::Forbidden) => return status(StatusCode::NOT_FOUND),
-            Err(PathError::Invalid | PathError::EscapesRoot) => {
-                return status(StatusCode::BAD_REQUEST);
-            }
-        };
+        let head = req.method() == Method::HEAD;
+        match self.respond(req, head).await {
+            Ok(res) => res,
+            Err(code) => self.error_response(code, head).await,
+        }
+    }
 
-        match self.locate(safe.relative.clone()).await {
-            Ok(Target::File { file, len }) => file_response(&safe.relative, file, len, head),
-            Ok(Target::Dir) if !safe.trailing_slash => {
+    async fn respond<B>(&self, req: &Request<B>, head: bool) -> Result<Response<Body>, StatusCode> {
+        if !matches!(*req.method(), Method::GET | Method::HEAD) {
+            return Err(StatusCode::METHOD_NOT_ALLOWED);
+        }
+        let safe = sanitize(req.uri().path(), self.inner.policy).map_err(|e| match e {
+            PathError::Forbidden => StatusCode::NOT_FOUND,
+            PathError::Invalid | PathError::EscapesRoot => StatusCode::BAD_REQUEST,
+        })?;
+
+        let target = self.locate(safe.relative.clone()).await;
+        match target.map_err(|e| io_status(&e))? {
+            Target::File { file, len } => Ok(file_response(&safe.relative, file, len, head)),
+            Target::Dir if !safe.trailing_slash => {
                 redirect_to_dir(&safe.relative, req.uri().query())
             }
-            Ok(Target::Dir) => {
+            Target::Dir => {
                 let index = safe.relative.join(INDEX);
                 match self.locate(index.clone()).await {
-                    Ok(Target::File { file, len }) => file_response(&index, file, len, head),
+                    Ok(Target::File { file, len }) => Ok(file_response(&index, file, len, head)),
+                    Err(e) if io_status(&e) != StatusCode::NOT_FOUND => Err(io_status(&e)),
+                    _ if safe.relative.as_os_str().is_empty() => {
+                        Ok(html_response(pages::welcome(), head))
+                    }
                     // Directory listings arrive in a later step.
-                    Ok(Target::Dir) => status(StatusCode::NOT_FOUND),
-                    Err(e) => io_error(&e),
+                    _ => Err(StatusCode::NOT_FOUND),
                 }
             }
-            Err(e) => io_error(&e),
         }
+    }
+
+    /// Serves the site's own `<code>.html` if it has one, else the built-in page.
+    async fn error_response(&self, code: StatusCode, head: bool) -> Response<Body> {
+        let custom = PathBuf::from(format!("{}.html", code.as_u16()));
+        let mut res = match self.locate(custom.clone()).await {
+            Ok(Target::File { file, len }) => file_response(&custom, file, len, head),
+            _ => html_response(pages::error(code), head),
+        };
+        *res.status_mut() = code;
+        if code == StatusCode::METHOD_NOT_ALLOWED {
+            res.headers_mut()
+                .insert(ALLOW, HeaderValue::from_static("GET, HEAD"));
+        }
+        res
     }
 
     /// Runs all filesystem work for one lookup in a single blocking task.
@@ -215,8 +239,23 @@ fn file_response(name: &Path, file: File, len: u64, head: bool) -> Response<Body
     res
 }
 
+fn html_response(page: Bytes, head: bool) -> Response<Body> {
+    let len = page.len();
+    let body = if head {
+        Body::empty()
+    } else {
+        Body::bytes(page)
+    };
+
+    let mut res = Response::new(body);
+    let headers = res.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static(HTML));
+    headers.insert(CONTENT_LENGTH, HeaderValue::from(len));
+    res
+}
+
 /// Rebuilt from the sanitized path so `//evil.com` can't become an off-site redirect.
-fn redirect_to_dir(relative: &Path, query: Option<&str>) -> Response<Body> {
+fn redirect_to_dir(relative: &Path, query: Option<&str>) -> Result<Response<Body>, StatusCode> {
     let mut location = String::from("/");
     for segment in relative.iter() {
         location.extend(utf8_percent_encode(&segment.to_string_lossy(), SEGMENT));
@@ -227,31 +266,18 @@ fn redirect_to_dir(relative: &Path, query: Option<&str>) -> Response<Body> {
         location.push_str(query);
     }
 
-    let Ok(location) = HeaderValue::try_from(location) else {
-        return status(StatusCode::INTERNAL_SERVER_ERROR);
-    };
-    let mut res = status(StatusCode::MOVED_PERMANENTLY);
-    res.headers_mut().insert(LOCATION, location);
-    res
-}
-
-fn method_not_allowed() -> Response<Body> {
-    let mut res = status(StatusCode::METHOD_NOT_ALLOWED);
-    res.headers_mut()
-        .insert(ALLOW, HeaderValue::from_static("GET, HEAD"));
-    res
-}
-
-fn io_error(e: &io::Error) -> Response<Body> {
-    match e.kind() {
-        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => status(StatusCode::NOT_FOUND),
-        io::ErrorKind::PermissionDenied => status(StatusCode::FORBIDDEN),
-        _ => status(StatusCode::INTERNAL_SERVER_ERROR),
-    }
-}
-
-fn status(code: StatusCode) -> Response<Body> {
+    let location =
+        HeaderValue::try_from(location).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut res = Response::new(Body::empty());
-    *res.status_mut() = code;
-    res
+    *res.status_mut() = StatusCode::MOVED_PERMANENTLY;
+    res.headers_mut().insert(LOCATION, location);
+    Ok(res)
+}
+
+fn io_status(e: &io::Error) -> StatusCode {
+    match e.kind() {
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => StatusCode::NOT_FOUND,
+        io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }

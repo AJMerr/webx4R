@@ -142,6 +142,74 @@ async fn other_methods_are_not_allowed() {
     assert_eq!(header(&res, ALLOW), "GET, HEAD");
 }
 
+mod pages {
+    use super::*;
+
+    fn text(bytes: Bytes) -> String {
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn root_without_index_shows_welcome_page() {
+        let site = Site::new();
+        fs::remove_file(site.dir.path().join("www/index.html")).unwrap();
+        let res = site.get("/").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(header(&res, CONTENT_TYPE), "text/html; charset=utf-8");
+        assert!(text(body(res).await).contains("webx4R is online"));
+    }
+
+    #[tokio::test]
+    async fn subdirectory_without_index_is_not_welcomed() {
+        let res = Site::new().get("/empty/").await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert!(text(body(res).await).contains("404 Not Found"));
+    }
+
+    #[tokio::test]
+    async fn errors_get_built_in_pages() {
+        let site = Site::new();
+        let res = site.get("/missing.html").await;
+        assert_eq!(header(&res, CONTENT_TYPE), "text/html; charset=utf-8");
+        assert!(text(body(res).await).contains("<h1>404 Not Found</h1>"));
+
+        let res = site.get("/%2e%2e/x").await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(text(body(res).await).contains("<h1>400 Bad Request</h1>"));
+    }
+
+    #[tokio::test]
+    async fn site_page_overrides_built_in() {
+        let site = Site::new();
+        fs::write(site.dir.path().join("www/404.html"), "custom 404").unwrap();
+        let res = site.get("/missing.html").await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(header(&res, CONTENT_LENGTH), "10");
+        assert_eq!(body(res).await, "custom 404");
+    }
+
+    #[tokio::test]
+    async fn head_error_has_length_but_no_body() {
+        let site = Site::new();
+        let res = site
+            .request(Method::HEAD, "/missing.html", PathPolicy::default())
+            .await;
+        let expected = crate::pages::error(StatusCode::NOT_FOUND).len().to_string();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(header(&res, CONTENT_LENGTH), expected);
+        assert!(body(res).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn method_not_allowed_keeps_allow_header() {
+        let site = Site::new();
+        let policy = PathPolicy::default();
+        let res = site.request(Method::DELETE, "/", policy).await;
+        assert_eq!(header(&res, ALLOW), "GET, HEAD");
+        assert!(text(body(res).await).contains("405 Method Not Allowed"));
+    }
+}
+
 mod symlinks {
     use std::path::Path;
 
