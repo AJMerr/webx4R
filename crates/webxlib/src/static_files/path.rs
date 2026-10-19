@@ -10,6 +10,8 @@ pub struct PathPolicy {
     /// Allow segments starting with `.`; a leading `/.well-known/` is always allowed.
     pub allow_dotfiles: bool,
     pub symlinks: Symlinks,
+    /// List the contents of directories that have no `index.html`.
+    pub directory_listing: bool,
 }
 
 /// How symlinks inside a site root are treated.
@@ -73,7 +75,11 @@ pub fn sanitize(path: &str, policy: PathPolicy) -> Result<SafePath, PathError> {
     })
 }
 
-fn check_segment(name: &str, policy: PathPolicy, is_first: bool) -> Result<(), PathError> {
+pub(super) fn check_segment(
+    name: &str,
+    policy: PathPolicy,
+    is_first: bool,
+) -> Result<(), PathError> {
     if name.contains(['\0', '/', '\\', ':']) {
         return Err(PathError::Invalid);
     }
@@ -109,10 +115,11 @@ mod tests {
     const DENY: PathPolicy = PathPolicy {
         allow_dotfiles: false,
         symlinks: Symlinks::InsideRoot,
+        directory_listing: false,
     };
     const ALLOW: PathPolicy = PathPolicy {
         allow_dotfiles: true,
-        symlinks: Symlinks::InsideRoot,
+        ..DENY
     };
 
     fn ok(path: &str) -> SafePath {

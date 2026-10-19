@@ -2,4 +2,5 @@
 
 pub mod body;
 pub mod mime;
+pub mod pages;
 pub mod static_files;

@@ -20,6 +20,9 @@ impl Site {
         for d in ["docs", "empty", "evil.com", "my dir", ".well-known"] {
             fs::create_dir_all(root.join(d)).unwrap();
         }
+        fs::create_dir_all(root.join("files/sub")).unwrap();
+        fs::write(root.join("files/a.txt"), "a").unwrap();
+        fs::write(root.join("files/.hidden"), "hidden").unwrap();
         fs::create_dir(dir.path().join("outside")).unwrap();
         fs::write(root.join("index.html"), "<h1>home</h1>").unwrap();
         fs::write(root.join("style.css"), "body{}").unwrap();
@@ -142,6 +145,119 @@ async fn other_methods_are_not_allowed() {
     assert_eq!(header(&res, ALLOW), "GET, HEAD");
 }
 
+mod pages {
+    use super::*;
+
+    fn text(bytes: Bytes) -> String {
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn root_without_index_shows_welcome_page() {
+        let site = Site::new();
+        fs::remove_file(site.dir.path().join("www/index.html")).unwrap();
+        let res = site.get("/").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(header(&res, CONTENT_TYPE), "text/html; charset=utf-8");
+        assert!(text(body(res).await).contains("webx4R is online"));
+    }
+
+    #[tokio::test]
+    async fn subdirectory_without_index_is_not_welcomed() {
+        let res = Site::new().get("/empty/").await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert!(text(body(res).await).contains("404 Not Found"));
+    }
+
+    #[tokio::test]
+    async fn errors_get_built_in_pages() {
+        let site = Site::new();
+        let res = site.get("/missing.html").await;
+        assert_eq!(header(&res, CONTENT_TYPE), "text/html; charset=utf-8");
+        assert!(text(body(res).await).contains("<h1>404 Not Found</h1>"));
+
+        let res = site.get("/%2e%2e/x").await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(text(body(res).await).contains("<h1>400 Bad Request</h1>"));
+    }
+
+    #[tokio::test]
+    async fn site_page_overrides_built_in() {
+        let site = Site::new();
+        fs::write(site.dir.path().join("www/404.html"), "custom 404").unwrap();
+        let res = site.get("/missing.html").await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(header(&res, CONTENT_LENGTH), "10");
+        assert_eq!(body(res).await, "custom 404");
+    }
+
+    #[tokio::test]
+    async fn head_error_has_length_but_no_body() {
+        let site = Site::new();
+        let res = site
+            .request(Method::HEAD, "/missing.html", PathPolicy::default())
+            .await;
+        let expected = crate::pages::error(StatusCode::NOT_FOUND).len().to_string();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(header(&res, CONTENT_LENGTH), expected);
+        assert!(body(res).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn method_not_allowed_keeps_allow_header() {
+        let site = Site::new();
+        let policy = PathPolicy::default();
+        let res = site.request(Method::DELETE, "/", policy).await;
+        assert_eq!(header(&res, ALLOW), "GET, HEAD");
+        assert!(text(body(res).await).contains("405 Method Not Allowed"));
+    }
+}
+
+mod listings {
+    use super::*;
+
+    const LISTING: PathPolicy = PathPolicy {
+        allow_dotfiles: false,
+        symlinks: Symlinks::InsideRoot,
+        directory_listing: true,
+    };
+
+    async fn listing_of(site: &Site, uri: &str) -> String {
+        let res = site.request(Method::GET, uri, LISTING).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        String::from_utf8(body(res).await.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn off_by_default() {
+        assert_eq!(Site::new().status("/files/").await, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn lists_files_and_folders_but_not_dotfiles() {
+        let html = listing_of(&Site::new(), "/files/").await;
+        assert!(html.contains(r#"href="/files/a.txt""#));
+        assert!(html.contains(r#"href="/files/sub/""#));
+        assert!(!html.contains(".hidden"));
+    }
+
+    #[tokio::test]
+    async fn index_html_still_wins() {
+        let res = Site::new().request(Method::GET, "/docs/", LISTING).await;
+        assert_eq!(body(res).await, "docs");
+    }
+
+    #[tokio::test]
+    async fn root_lists_instead_of_welcome() {
+        let site = Site::new();
+        fs::remove_file(site.dir.path().join("www/index.html")).unwrap();
+        let html = listing_of(&site, "/").await;
+        assert!(html.contains("<title>Index of /</title>"));
+        assert!(!html.contains("webx4R is online"));
+        assert!(!html.contains(".env"));
+    }
+}
+
 mod symlinks {
     use std::path::Path;
 
@@ -216,6 +332,35 @@ mod symlinks {
         assert_eq!(dir_link.status(), StatusCode::NOT_FOUND);
         assert_eq!(plain.status(), StatusCode::OK);
         assert_eq!(root.status(), StatusCode::OK);
+    }
+
+    async fn root_listing(site: &Site, symlinks: Symlinks) -> String {
+        fs::remove_file(site.dir.path().join("www/index.html")).unwrap();
+        let policy = PathPolicy {
+            symlinks,
+            directory_listing: true,
+            ..PathPolicy::default()
+        };
+        let res = site.request(Method::GET, "/", policy).await;
+        String::from_utf8(body(res).await.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn listing_shows_only_reachable_links() {
+        let html = root_listing(&site_with_links(), Symlinks::InsideRoot).await;
+        assert!(html.contains(r#"href="/link-in.css""#));
+        assert!(html.contains(r#"href="/docs-link/""#));
+        assert!(!html.contains("link-out.txt"));
+        assert!(!html.contains("rel-out.txt"));
+        assert!(!html.contains("abs-in.css"));
+    }
+
+    #[tokio::test]
+    async fn listing_hides_all_links_under_deny() {
+        let html = root_listing(&site_with_links(), Symlinks::Deny).await;
+        assert!(html.contains(r#"href="/style.css""#));
+        assert!(!html.contains("link-in.css"));
+        assert!(!html.contains("docs-link"));
     }
 
     #[tokio::test]
