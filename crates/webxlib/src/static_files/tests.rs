@@ -33,10 +33,23 @@ impl Site {
         Self { dir }
     }
 
-    async fn request(&self, method: Method, uri: &str, policy: PathPolicy) -> Response<Body> {
+    async fn send(&self, req: Request<()>, policy: PathPolicy) -> Response<Body> {
         let server = StaticFiles::new(self.dir.path().join("www"), policy).unwrap();
-        let req = Request::builder().method(method).uri(uri).body(()).unwrap();
         server.serve(&req).await
+    }
+
+    async fn request(&self, method: Method, uri: &str, policy: PathPolicy) -> Response<Body> {
+        let req = Request::builder().method(method).uri(uri).body(()).unwrap();
+        self.send(req, policy).await
+    }
+
+    async fn get_headers(&self, uri: &str, headers: &[(HeaderName, &str)]) -> Response<Body> {
+        let mut req = Request::builder().uri(uri);
+        for (name, value) in headers {
+            req = req.header(name, *value);
+        }
+        let req = req.body(()).unwrap();
+        self.send(req, PathPolicy::default()).await
     }
 
     async fn get(&self, uri: &str) -> Response<Body> {
@@ -210,6 +223,70 @@ mod pages {
         let res = site.request(Method::DELETE, "/", policy).await;
         assert_eq!(header(&res, ALLOW), "GET, HEAD");
         assert!(text(body(res).await).contains("405 Method Not Allowed"));
+    }
+}
+
+mod conditional_requests {
+    use http::header::{ETAG, IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
+
+    use super::*;
+
+    async fn etag_of(site: &Site, uri: &str) -> String {
+        header(&site.get(uri).await, ETAG).to_owned()
+    }
+
+    #[tokio::test]
+    async fn files_carry_validators() {
+        let res = Site::new().get("/style.css").await;
+        assert!(header(&res, ETAG).starts_with('"'));
+        assert!(httpdate::parse_http_date(header(&res, LAST_MODIFIED)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn index_html_carries_validators_but_error_pages_do_not() {
+        let site = Site::new();
+        assert!(site.get("/").await.headers().contains_key(ETAG));
+        assert!(!site.get("/missing.html").await.headers().contains_key(ETAG));
+    }
+
+    #[tokio::test]
+    async fn matching_etag_is_not_modified() {
+        let site = Site::new();
+        let etag = etag_of(&site, "/style.css").await;
+        let headers = [(IF_NONE_MATCH, etag.as_str())];
+        let res = site.get_headers("/style.css", &headers).await;
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(header(&res, ETAG), etag);
+        assert!(body(res).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_etag_gets_the_full_file() {
+        let site = Site::new();
+        let headers = [(IF_NONE_MATCH, "\"old\"")];
+        let res = site.get_headers("/style.css", &headers).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body(res).await, "body{}");
+    }
+
+    #[tokio::test]
+    async fn unchanged_since_last_modified_is_not_modified() {
+        let site = Site::new();
+        let res = site.get("/style.css").await;
+        let last_modified = header(&res, LAST_MODIFIED).to_owned();
+        let headers = [(IF_MODIFIED_SINCE, last_modified.as_str())];
+        let res = site.get_headers("/style.css", &headers).await;
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn failed_if_match_is_precondition_failed() {
+        let site = Site::new();
+        let headers = [(IF_MATCH, "\"nope\"")];
+        let res = site.get_headers("/style.css", &headers).await;
+        assert_eq!(res.status(), StatusCode::PRECONDITION_FAILED);
+        let page = String::from_utf8(body(res).await.to_vec()).unwrap();
+        assert!(page.contains("412 Precondition Failed"));
     }
 }
 

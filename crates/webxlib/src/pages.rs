@@ -32,6 +32,7 @@ fn message(code: StatusCode) -> &'static str {
         StatusCode::METHOD_NOT_ALLOWED => {
             "the request method is recognized by the server, but not supported by the target resource"
         }
+        StatusCode::PRECONDITION_FAILED => "a condition in the request was not met",
         StatusCode::INTERNAL_SERVER_ERROR => "the server encountered an unexpected error",
         StatusCode::BAD_GATEWAY => "the server got an invalid response from an upstream server",
         StatusCode::SERVICE_UNAVAILABLE => "the server is temporarily unable to handle the request",
