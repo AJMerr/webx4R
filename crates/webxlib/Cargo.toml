@@ -9,3 +9,4 @@ publish.workspace = true
 
 [dependencies]
 mime_guess.workspace = true
+percent-encoding.workspace = true

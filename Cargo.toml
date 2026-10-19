@@ -13,3 +13,4 @@ publish = false
 webxlib = { path = "crates/webxlib" }
 webxcore = { path = "crates/webxcore" }
 mime_guess = { version = "2.0.5", default-features = false }
+percent-encoding = "2.3.2"
