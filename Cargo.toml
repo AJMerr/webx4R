@@ -12,3 +12,4 @@ publish = false
 [workspace.dependencies]
 webxlib = { path = "crates/webxlib" }
 webxcore = { path = "crates/webxcore" }
+mime_guess = { version = "2.0.5", default-features = false }
