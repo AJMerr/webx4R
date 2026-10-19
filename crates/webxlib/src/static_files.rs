@@ -153,6 +153,10 @@ impl Inner {
         };
         let mut dir = self.dir.try_clone()?;
         for part in parts {
+            // Checked explicitly: the error a no-follow open gives for a link differs by OS.
+            if dir.symlink_metadata(part)?.file_type().is_symlink() {
+                return Err(io::ErrorKind::NotFound.into());
+            }
             dir = dir.open_dir_nofollow(part)?;
         }
 
