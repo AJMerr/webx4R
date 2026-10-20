@@ -1,17 +1,14 @@
 //! `webx4r`: command-line interface for the webx4R app platform.
 
-use std::io::IsTerminal;
+mod logging;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use tracing_subscriber::EnvFilter;
 use webxcore::config::{Config, ConfigError};
 use webxcore::control::{self, ControlListener};
 use webxcore::server::{Reloader, Server};
-
-/// Log filter variable, e.g. `WEBX4R_LOG=debug`.
-const LOG_ENV: &str = "WEBX4R_LOG";
 
 #[derive(Parser)]
 #[command(version, about = "The webx4R app platform")]
@@ -39,31 +36,35 @@ enum Command {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    init_logging();
     match cli.command {
         Command::Serve { config } => serve(&config).await,
-        Command::Reload { config } => request_reload(&config).await,
+        Command::Reload { config } => {
+            let _ = logging::init(None);
+            request_reload(&config).await
+        }
     }
 }
 
-fn init_logging() {
-    let filter = EnvFilter::try_from_env(LOG_ENV).unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .with_ansi(std::io::stderr().is_terminal())
-        .init();
-}
-
 async fn serve(path: &Path) -> ExitCode {
-    let config = match Config::load(path) {
+    // Loaded first, since `[log]` decides where errors go; a bad config is reported on stderr.
+    let config = Config::load(path);
+    let logging = logging::init(config.as_ref().ok().and_then(|config| config.log.as_ref()));
+    let config = match config {
         Ok(config) => config,
         Err(e) => return fail(describe(path, e)),
     };
-    let server = match Server::bind(&config).await {
+    // Held until exit; dropping it flushes the log files.
+    let mut logging = match logging {
+        Ok(logging) => logging,
+        Err(e) => return fail(e),
+    };
+    let mut server = match Server::bind(&config).await {
         Ok(server) => server,
         Err(e) => return fail(e),
     };
+    if let Some(access) = logging.access.take() {
+        server.set_access_log(access);
+    }
     let control = match ControlListener::bind(&config.control_endpoint()) {
         Ok(control) => control,
         Err(e) => return fail(e),

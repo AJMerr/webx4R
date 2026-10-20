@@ -38,5 +38,6 @@ tokio-rustls = "0.26.6"
 tokio-util = "0.7.20"
 toml = "1.1.8"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 x509-parser = "0.18.1"
