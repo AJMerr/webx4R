@@ -607,6 +607,20 @@ async fn reload_rejects_acme_changes() {
     server.stop().await;
 }
 
+#[tokio::test]
+async fn reload_rejects_log_and_metrics_changes() {
+    let server = Running::start(false).await;
+    for (table, added) in [
+        ("[log]", "[log]\ndir = \"logs\"\n"),
+        ("[metrics]", "[metrics]\nlisten = \"127.0.0.1:9100\"\n"),
+    ] {
+        let err = server.reload(&format!("{}{added}", server.config)).unwrap_err();
+        assert_eq!(err.to_string(), format!("{table} settings changed; restart to apply them"));
+    }
+    assert!(server.get("a.test").await.ends_with("site a"), "the old config stays");
+    server.stop().await;
+}
+
 /// Waits until the manager has saved a cert covering `names`.
 async fn wait_for_cert(storage: &Storage, names: &[&str], pebble: &Pebble) -> acme::Issued {
     let names: Vec<_> = names.iter().map(|name| name.to_string()).collect();

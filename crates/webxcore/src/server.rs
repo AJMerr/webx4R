@@ -61,9 +61,11 @@ pub struct Reloader {
     client: proxy::Client,
     /// Present when serving HTTPS.
     certs: Option<Arc<CertStore>>,
-    /// The `[server]` and `[acme]` tables, which only a restart can change.
+    /// The tables only a restart can change.
     server: config::Server,
     acme: Option<config::Acme>,
+    log: Option<config::Log>,
+    metrics: Option<config::Metrics>,
     /// Tells the ACME manager which names the new config needs certs for.
     manager: Option<acme::Handle>,
     /// The bound HTTPS port, for redirects.
@@ -83,6 +85,12 @@ impl Reloader {
         }
         if config.acme != self.acme {
             return restart("[acme]");
+        }
+        if config.log != self.log {
+            return restart("[log]");
+        }
+        if config.metrics != self.metrics {
+            return restart("[metrics]");
         }
         let router = Router::new(config, self.client.clone(), self.https_port)?;
         let certs = match &self.certs {
@@ -153,6 +161,8 @@ impl Server {
             certs,
             server: config.server.clone(),
             acme: config.acme.clone(),
+            log: config.log.clone(),
+            metrics: config.metrics.clone(),
             manager: handle,
             https_port,
         };
