@@ -22,7 +22,7 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct Server {
     /// Address for plain HTTP, e.g. `0.0.0.0:8080`.
-    pub http: SocketAddr,
+    pub http: Option<SocketAddr>,
     /// Address for HTTPS, e.g. `0.0.0.0:8443`.
     pub https: Option<SocketAddr>,
 }
@@ -123,6 +123,9 @@ impl Config {
 
     fn validate(&self) -> Result<(), ConfigError> {
         let invalid = |msg: String| Err(ConfigError::Invalid(msg));
+        if self.server.http.is_none() && self.server.https.is_none() {
+            return invalid("[server] needs `http`, `https` or both".into());
+        }
         if self.sites.is_empty() {
             return invalid("config needs at least one [[site]]".into());
         }
@@ -212,7 +215,8 @@ mod tests {
     #[test]
     fn minimal_config_with_defaults() {
         let config = parse(MINIMAL).unwrap();
-        assert_eq!(config.server.http, "0.0.0.0:8080".parse().unwrap());
+        assert_eq!(config.server.http, Some("0.0.0.0:8080".parse().unwrap()));
+        assert_eq!(config.server.https, None);
         let site = &config.sites[0];
         assert_eq!(site.root, Path::new("/etc/webx4r/www"));
         assert!(!site.default && !site.directory_listing && !site.allow_dotfiles);
@@ -257,6 +261,14 @@ mod tests {
         let bad_symlinks = MINIMAL.replace("root = \"www\"", "root = \"www\"\nsymlinks = \"some\"");
         assert!(matches!(parse(&bad_addr), Err(ConfigError::Parse(_))));
         assert!(matches!(parse(&bad_symlinks), Err(ConfigError::Parse(_))));
+    }
+
+    #[test]
+    fn needs_an_address() {
+        let msg = invalid(&MINIMAL.replace("http = \"0.0.0.0:8080\"", ""));
+        assert_eq!(msg, "[server] needs `http`, `https` or both");
+        let https_only = MINIMAL.replace("http =", "https =") + "cert = \"a.crt\"\nkey = \"a.key\"";
+        assert_eq!(parse(&https_only).unwrap().server.http, None);
     }
 
     #[test]

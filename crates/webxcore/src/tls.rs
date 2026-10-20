@@ -6,6 +6,7 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
+use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -13,6 +14,19 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 
 use crate::config::Config;
+
+/// rustls settings for the HTTPS listener: TLS 1.2 and 1.3, certs by SNI, h2 or HTTP/1.1 by ALPN.
+pub fn server_config(config: &Config) -> io::Result<ServerConfig> {
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let certs = Certs::new(config, &provider)?;
+    let mut tls = ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("aws-lc-rs supports TLS 1.2 and 1.3")
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(certs));
+    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(tls)
+}
 
 /// Each site's certificate, keyed by hostname.
 #[derive(Debug)]
@@ -75,14 +89,14 @@ fn load(cert: &Path, key: &Path, provider: &CryptoProvider) -> io::Result<Certif
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::fs;
     use std::path::PathBuf;
 
     use super::*;
 
     /// Writes a self-signed cert and key for `host` into `dir`.
-    fn write_pair(dir: &Path, host: &str) -> (PathBuf, PathBuf) {
+    pub(crate) fn write_pair(dir: &Path, host: &str) -> (PathBuf, PathBuf) {
         let pair = rcgen::generate_simple_self_signed(vec![host.to_owned()]).unwrap();
         let (cert, key) = (dir.join(format!("{host}.crt")), dir.join(format!("{host}.key")));
         fs::write(&cert, pair.cert.pem()).unwrap();
