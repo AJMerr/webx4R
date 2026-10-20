@@ -1,4 +1,5 @@
-//! HTTPS certificates: loads each site's PEM files and picks one per handshake by SNI.
+//! HTTPS certificates: loads each site's PEM files or self-signs localhost names,
+//! and picks one per handshake by SNI.
 
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -9,11 +10,11 @@ use std::sync::Arc;
 use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 
-use crate::config::Config;
+use crate::config::{Config, is_localhost};
 
 /// rustls settings for the HTTPS listener: TLS 1.2 and 1.3, certs by SNI, h2 or HTTP/1.1 by ALPN.
 pub fn server_config(config: &Config) -> io::Result<ServerConfig> {
@@ -37,16 +38,26 @@ pub struct Certs {
 }
 
 impl Certs {
-    /// Loads the cert files of every site that has them.
+    /// Loads each site's cert files; a site without them gets a self-signed cert
+    /// for its localhost names, if it has any.
     pub fn new(config: &Config, provider: &CryptoProvider) -> io::Result<Self> {
         let mut by_host = HashMap::new();
         let mut default = None;
         for (i, site) in config.sites.iter().enumerate() {
-            let (Some(cert), Some(key)) = (&site.cert, &site.key) else { continue };
-            let certified = load(cert, key, provider)
-                .map_err(|e| io::Error::new(e.kind(), format!("site {}: {e}", i + 1)))?;
+            let (certified, hosts) = match (&site.cert, &site.key) {
+                (Some(cert), Some(key)) => (load(cert, key, provider), site.hosts.iter().collect()),
+                _ => {
+                    let local: Vec<_> = site.hosts.iter().filter(|h| is_localhost(h)).collect();
+                    if local.is_empty() {
+                        continue;
+                    }
+                    (self_signed(&local, provider), local)
+                }
+            };
+            let certified =
+                certified.map_err(|e| io::Error::new(e.kind(), format!("site {}: {e}", i + 1)))?;
             let certified = Arc::new(certified);
-            for host in &site.hosts {
+            for host in hosts {
                 by_host.insert(host.clone(), Arc::clone(&certified));
             }
             if site.default {
@@ -86,6 +97,21 @@ fn load(cert: &Path, key: &Path, provider: &CryptoProvider) -> io::Result<Certif
         let (key, cert) = (key.display(), cert.display());
         io::Error::new(io::ErrorKind::InvalidData, format!("can't use {key} with {cert}: {e}"))
     })
+}
+
+/// Generates an in-memory cert for `hosts` and the loopback addresses.
+fn self_signed(hosts: &[&String], provider: &CryptoProvider) -> io::Result<CertifiedKey> {
+    let error = |e: &dyn Display| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("can't self-sign {hosts:?}: {e}"))
+    };
+    let mut names: Vec<String> = hosts.iter().map(|host| host.to_string()).collect();
+    names.extend(["127.0.0.1".to_owned(), "::1".to_owned()]);
+    let pair = rcgen::generate_simple_self_signed(names).map_err(|e| error(&e))?;
+    let key = PrivatePkcs8KeyDer::from(pair.signing_key.serialize_der());
+    let certified = CertifiedKey::from_der(vec![pair.cert.der().clone()], key.into(), provider)
+        .map_err(|e| error(&e))?;
+    tracing::info!(?hosts, "using a self-signed certificate; browsers will warn about it");
+    Ok(certified)
 }
 
 #[cfg(test)]
@@ -169,5 +195,55 @@ pub(crate) mod tests {
         fs::write(&cert, "").unwrap();
         let empty = certs(dir.path(), &site("a.test", "a.test", false)).unwrap_err().to_string();
         assert!(empty.ends_with("no certificates found"), "{empty}");
+    }
+
+    /// Whether `cert`, trusted as its own root, is valid for `name`.
+    fn valid_for(cert: &CertificateDer<'static>, name: &str) -> bool {
+        use rustls::client::WebPkiServerVerifier;
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::{ServerName, UnixTime};
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.clone()).unwrap();
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let verifier =
+            WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider).build().unwrap();
+        let name = ServerName::try_from(name.to_owned()).unwrap();
+        verifier.verify_server_cert(cert, &[], &name, &[], UnixTime::now()).is_ok()
+    }
+
+    #[test]
+    fn localhost_names_are_self_signed() {
+        let dir = tempfile::tempdir().unwrap();
+        let sites = "[[site]]\nhosts = [\"localhost\", \"app.localhost\", \"example.com\"]\n\
+                     root = \"www\"\n";
+        let certs = certs(dir.path(), sites).unwrap();
+
+        let certified = certs.lookup(Some("app.localhost")).unwrap();
+        for name in ["localhost", "app.localhost", "127.0.0.1", "::1"] {
+            assert!(valid_for(&certified.cert[0], name), "{name}");
+        }
+        assert!(!valid_for(&certified.cert[0], "example.com"));
+        assert!(
+            certs.lookup(Some("example.com")).is_none(),
+            "only localhost names are self-signed"
+        );
+    }
+
+    #[test]
+    fn default_localhost_site_covers_clients_without_sni() {
+        let dir = tempfile::tempdir().unwrap();
+        let sites = "[[site]]\nhosts = [\"localhost\"]\nroot = \"www\"\ndefault = true\n";
+        let certified = certs(dir.path(), sites).unwrap().lookup(None).unwrap();
+        assert!(valid_for(&certified.cert[0], "127.0.0.1"));
+    }
+
+    #[test]
+    fn cert_files_override_self_signing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, _) = write_pair(dir.path(), "localhost");
+        let certs = certs(dir.path(), &site("localhost", "localhost", false)).unwrap();
+        let file_cert = CertificateDer::from_pem_file(cert).unwrap();
+        assert_eq!(certs.lookup(Some("localhost")).unwrap().cert[0], file_cert);
     }
 }

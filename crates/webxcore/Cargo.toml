@@ -11,6 +11,7 @@ publish.workspace = true
 http.workspace = true
 hyper = { workspace = true, features = ["http1", "http2", "server"] }
 hyper-util = { workspace = true, features = ["http1", "http2", "server-auto", "server-graceful", "tokio"] }
+rcgen.workspace = true
 rustls.workspace = true
 serde.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }
@@ -23,6 +24,5 @@ webxlib.workspace = true
 bytes.workspace = true
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["client"] }
-rcgen.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "rt-multi-thread", "sync"] }
