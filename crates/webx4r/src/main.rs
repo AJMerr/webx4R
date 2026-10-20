@@ -75,6 +75,9 @@ async fn serve(path: &Path) -> ExitCode {
     if let Some(addr) = server.https_addr() {
         tracing::info!("listening on https://{addr}");
     }
+    if let Some(addr) = server.metrics_addr() {
+        tracing::info!("serving metrics at http://{addr}/metrics");
+    }
     tracing::info!("`webx4r reload` reaches this server at {}", control.endpoint().display());
 
     // Registered before serving: until a handler exists, SIGHUP would kill the process.

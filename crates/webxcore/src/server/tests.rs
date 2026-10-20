@@ -25,6 +25,7 @@ use crate::tls::tests::write_pair;
 struct Running {
     http: Option<SocketAddr>,
     https: Option<SocketAddr>,
+    scrape: Option<SocketAddr>,
     stop: Option<oneshot::Sender<()>>,
     done: tokio::task::JoinHandle<()>,
     reloader: Reloader,
@@ -84,7 +85,8 @@ impl Running {
         server.set_access_log(AccessLog::new(config::AccessFormat::Json, move |line| {
             sink.lock().unwrap().push(serde_json::from_slice(line).unwrap());
         }));
-        let (http, https) = (server.http_addr(), server.https_addr());
+        let (http, https, scrape) =
+            (server.http_addr(), server.https_addr(), server.metrics_addr());
         let reloader = server.reloader();
         let (challenges, metrics) = (server.challenges.clone(), server.metrics());
         let (stop, stopped) = oneshot::channel();
@@ -93,7 +95,7 @@ impl Running {
         }));
         let config = text.to_owned();
         let stop = Some(stop);
-        Self { http, https, stop, done, reloader, challenges, metrics, access, config, dir }
+        Self { http, https, scrape, stop, done, reloader, challenges, metrics, access, config, dir }
     }
 
     /// Waits briefly for the metrics to contain every line in `lines`: like an access log
@@ -154,11 +156,7 @@ impl Running {
 
     /// Sends a raw HTTP/1.1 request and returns the whole response as text.
     async fn raw(&self, request: &str) -> String {
-        let mut stream = TcpStream::connect(self.http.unwrap()).await.unwrap();
-        stream.write_all(request.as_bytes()).await.unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).await.unwrap();
-        response
+        raw_at(self.http.unwrap(), request).await
     }
 
     async fn get(&self, host: &str) -> String {
@@ -173,6 +171,15 @@ impl Running {
         self.stop.take().unwrap().send(()).unwrap();
         self.done.await.unwrap();
     }
+}
+
+/// Sends a raw request to `addr` and returns the whole response as text.
+async fn raw_at(addr: SocketAddr, request: &str) -> String {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    response
 }
 
 /// Sends `GET https://{host}/` with the protocol ALPN chose; returns the version and body.
@@ -392,8 +399,52 @@ async fn metrics_count_connections_failures_and_reloads() {
 #[tokio::test]
 async fn no_metrics_without_the_table() {
     let server = Running::start(false).await;
-    assert!(server.metrics.is_none());
+    assert!(server.metrics.is_none() && server.scrape.is_none());
     server.stop().await;
+}
+
+#[tokio::test]
+async fn serves_metrics_on_their_own_listener() {
+    let text = "[server]\nhttp = \"127.0.0.1:0\"\n[[site]]\nhosts = [\"a.test\"]\nroot = \"a\"\n\
+                [metrics]\nlisten = \"127.0.0.1:0\"\n";
+    let server = Running::start_with(tempfile::tempdir().unwrap(), text).await;
+    server.get("a.test").await;
+    let counted = "webx4r_http_responses_total{site=\"a.test\",code=\"2xx\"} 1";
+    server.wait_for_metrics(&[counted]).await;
+    let scrape = server.scrape.unwrap();
+    let request = |method: &str, path: &str| {
+        let request = format!("{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        async move { raw_at(scrape, &request).await }
+    };
+
+    let res = request("GET", "/metrics").await;
+    assert!(res.starts_with("HTTP/1.1 200 OK\r\n"), "{res}");
+    assert!(res.contains(&format!("\r\ncontent-type: {OPENMETRICS}\r\n")), "{res}");
+    assert!(res.contains(&format!("\n{counted}\n")) && res.ends_with("# EOF\n"), "{res}");
+    let head = request("HEAD", "/metrics").await;
+    assert!(head.contains("\r\ncontent-length: ") && head.ends_with("\r\n\r\n"), "{head}");
+    let post = request("POST", "/metrics").await;
+    assert!(
+        post.starts_with("HTTP/1.1 405") && post.contains("\r\nallow: GET, HEAD\r\n"),
+        "{post}"
+    );
+    let other = request("GET", "/").await;
+    assert!(other.starts_with("HTTP/1.1 404"), "{other}");
+
+    // Scrapes aren't site traffic: they're neither counted nor logged.
+    let res = request("GET", "/metrics").await;
+    assert!(res.contains(&format!("\n{counted}\n")), "{res}");
+    assert!(res.contains("\nwebx4r_connections_total{listener=\"http\"} 1\n"), "{res}");
+    assert_eq!(server.access.lock().unwrap().len(), 1);
+
+    // An idle keep-alive scrape connection doesn't hold up shutdown.
+    let stream = TcpStream::connect(scrape).await.unwrap();
+    let (mut sender, conn) =
+        hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.unwrap();
+    tokio::spawn(conn);
+    let req = Request::get("/metrics").body(Empty::<Bytes>::new()).unwrap();
+    assert_eq!(sender.send_request(req).await.unwrap().status(), StatusCode::OK);
+    tokio::time::timeout(Duration::from_secs(5), server.stop()).await.unwrap();
 }
 
 #[tokio::test]

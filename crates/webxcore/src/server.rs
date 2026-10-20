@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use http::header::{HOST, LOCATION};
+use http::header::{ALLOW, CONTENT_TYPE, HOST, HeaderValue, LOCATION};
 use http::uri::{Authority, PathAndQuery};
 use http::{Method, Request, Response, StatusCode, Uri, Version};
 use hyper::body::Incoming;
@@ -21,7 +21,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::{GracefulShutdown, Watcher};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use webxlib::body::Body;
 use webxlib::pages;
@@ -49,6 +49,8 @@ type ConnBuilder = auto::Builder<TokioExecutor>;
 pub struct Server {
     http: Option<Listener>,
     https: Option<Listener>,
+    /// Serves `/metrics`; present with `[metrics]`.
+    scrape: Option<Listener>,
     reloader: Reloader,
     /// Present with `[acme]`, like `manager`.
     challenges: Option<Arc<Challenges>>,
@@ -137,6 +139,24 @@ impl Listener {
             .map_err(|e| io::Error::new(e.kind(), format!("can't listen on {addr}: {e}")))?;
         Ok(Self { addr: tcp.local_addr()?, tcp, tls })
     }
+
+    /// The next connection; failed accepts are logged and retried.
+    async fn next(&self) -> (TcpStream, SocketAddr) {
+        loop {
+            match self.tcp.accept().await {
+                Ok((stream, peer)) => {
+                    if let Err(e) = stream.set_nodelay(true) {
+                        tracing::debug!(%peer, error = %e, "couldn't set TCP_NODELAY");
+                    }
+                    return (stream, peer);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "accept failed");
+                    tokio::time::sleep(ACCEPT_BACKOFF).await;
+                }
+            }
+        }
+    }
 }
 
 impl Server {
@@ -157,6 +177,10 @@ impl Server {
                 Some(Listener::bind(addr, Some(acceptor)).await?)
             }
             _ => None,
+        };
+        let scrape = match &config.metrics {
+            Some(metrics) => Some(Listener::bind(metrics.listen, None).await?),
+            None => None,
         };
         // After binding, so redirects name the port actually bound.
         let https_port = https.as_ref().map(|listener| listener.addr.port());
@@ -184,7 +208,7 @@ impl Server {
             https_port,
             registry,
         };
-        Ok(Self { http, https, reloader, challenges, manager, access_log: None })
+        Ok(Self { http, https, scrape, reloader, challenges, manager, access_log: None })
     }
 
     /// Records every response in `log` from now on.
@@ -210,6 +234,11 @@ impl Server {
         self.https.as_ref().map(|listener| listener.addr)
     }
 
+    /// Where `/metrics` is served; present with `[metrics]`.
+    pub fn metrics_addr(&self) -> Option<SocketAddr> {
+        self.scrape.as_ref().map(|listener| listener.addr)
+    }
+
     /// Serves, and keeps ACME certs issued, until `shutdown` resolves; then lets in-flight
     /// requests finish.
     pub async fn run(mut self, shutdown: impl Future<Output = ()>) {
@@ -228,8 +257,9 @@ impl Server {
         };
         let http = self.accept(self.http.as_ref(), &builder, &graceful);
         let https = self.accept(self.https.as_ref(), &builder, &graceful);
+        let scrape = self.serve_metrics(&builder, &graceful);
         tokio::select! {
-            _ = async { tokio::join!(http, https, acme) } => {}
+            _ = async { tokio::join!(http, https, scrape, acme) } => {}
             () = shutdown => {}
         }
 
@@ -254,18 +284,7 @@ impl Server {
         let metrics =
             self.reloader.registry.as_ref().map(|registry| Arc::new(registry.listener(name)));
         loop {
-            let (stream, peer) = match listener.tcp.accept().await {
-                Ok(accepted) => accepted,
-                Err(e) => {
-                    tracing::warn!(error = %e, "accept failed");
-                    tokio::time::sleep(ACCEPT_BACKOFF).await;
-                    continue;
-                }
-            };
-            if let Err(e) = stream.set_nodelay(true) {
-                tracing::debug!(%peer, error = %e, "couldn't set TCP_NODELAY");
-            }
-
+            let (stream, peer) = listener.next().await;
             let conn = Connection {
                 peer: Peer { addr: peer, https: listener.tls.is_some() },
                 router: Arc::clone(&self.reloader.router),
@@ -312,6 +331,46 @@ impl Server {
             };
         }
     }
+
+    /// Answers scrapes until dropped; without `[metrics]`, waits forever.
+    async fn serve_metrics(&self, builder: &Arc<ConnBuilder>, graceful: &GracefulShutdown) {
+        let (Some(listener), Some(registry)) = (&self.scrape, &self.reloader.registry) else {
+            return std::future::pending().await;
+        };
+        loop {
+            let (stream, peer) = listener.next().await;
+            let registry = Arc::clone(registry);
+            let service = service_fn(move |req| {
+                std::future::ready(Ok::<_, Infallible>(metrics_response(&registry, &req)))
+            });
+            let conn = builder.serve_connection(TokioIo::new(stream), service).into_owned();
+            let conn = graceful.watch(conn);
+            tokio::spawn(async move {
+                if let Err(e) = conn.await {
+                    tracing::debug!(%peer, error = %e, "metrics connection ended with an error");
+                }
+            });
+        }
+    }
+}
+
+/// The content type of [`Metrics::encode`]'s output.
+const OPENMETRICS: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
+
+/// Every metric at `/metrics`; 404 elsewhere.
+fn metrics_response<B>(registry: &Metrics, req: &Request<B>) -> Response<Body> {
+    if req.uri().path() != "/metrics" {
+        return pages::error_response(StatusCode::NOT_FOUND);
+    }
+    if !matches!(*req.method(), Method::GET | Method::HEAD) {
+        let mut res = pages::error_response(StatusCode::METHOD_NOT_ALLOWED);
+        res.headers_mut().insert(ALLOW, HeaderValue::from_static("GET, HEAD"));
+        return res;
+    }
+    Response::builder()
+        .header(CONTENT_TYPE, OPENMETRICS)
+        .body(Body::bytes(registry.encode()))
+        .expect("the content type is a valid header value")
 }
 
 /// An accepted connection, served once any TLS handshake is done.
