@@ -7,9 +7,8 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 use webxcore::config::{Config, ConfigError};
-#[cfg(unix)]
-use webxcore::server::Reloader;
-use webxcore::server::Server;
+use webxcore::control::{self, ControlListener};
+use webxcore::server::{Reloader, Server};
 
 /// Log filter variable, e.g. `WEBX4R_LOG=debug`.
 const LOG_ENV: &str = "WEBX4R_LOG";
@@ -29,6 +28,12 @@ enum Command {
         #[arg(short, long, default_value = "webx4r.toml")]
         config: PathBuf,
     },
+    /// Make a running server reload its config file.
+    Reload {
+        /// Path to the config file the server was started with.
+        #[arg(short, long, default_value = "webx4r.toml")]
+        config: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -37,6 +42,7 @@ async fn main() -> ExitCode {
     init_logging();
     match cli.command {
         Command::Serve { config } => serve(&config).await,
+        Command::Reload { config } => request_reload(&config).await,
     }
 }
 
@@ -58,12 +64,17 @@ async fn serve(path: &Path) -> ExitCode {
         Ok(server) => server,
         Err(e) => return fail(e),
     };
+    let control = match ControlListener::bind(&config.control_endpoint()) {
+        Ok(control) => control,
+        Err(e) => return fail(e),
+    };
     if let Some(addr) = server.http_addr() {
         tracing::info!("listening on http://{addr}");
     }
     if let Some(addr) = server.https_addr() {
         tracing::info!("listening on https://{addr}");
     }
+    tracing::info!("`webx4r reload` reaches this server at {}", control.endpoint().display());
 
     // Registered before serving: until a handler exists, SIGHUP would kill the process.
     #[cfg(unix)]
@@ -74,9 +85,36 @@ async fn serve(path: &Path) -> ExitCode {
         Err(e) => tracing::warn!(error = %e, "can't listen for SIGHUP"),
     }
 
-    server.run(shutdown_signal()).await;
+    let on_reload = {
+        let (path, reloader) = (path.to_owned(), server.reloader());
+        move || reload(&path, &reloader)
+    };
+    // The control loop never ends; it's dropped, removing its socket, once the server stops.
+    tokio::select! {
+        () = server.run(shutdown_signal()) => {}
+        () = control.run(on_reload) => {}
+    }
     tracing::info!("stopped");
     ExitCode::SUCCESS
+}
+
+/// `webx4r reload`: asks the server over its control socket and reports the outcome.
+async fn request_reload(path: &Path) -> ExitCode {
+    let config = match Config::load(path) {
+        Ok(config) => config,
+        Err(e) => return fail(format!("reload failed: {}", describe(path, e))),
+    };
+    let endpoint = config.control_endpoint();
+    match control::request_reload(&endpoint).await {
+        Ok(Ok(())) => {
+            tracing::info!("reloaded {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Ok(Err(e)) => fail(format!("reload failed: {e}")),
+        Err(e) => {
+            fail(format!("can't reach webx4r at {}: {e}; is it running?", endpoint.display()))
+        }
+    }
 }
 
 fn fail(error: impl std::fmt::Display) -> ExitCode {
@@ -92,8 +130,19 @@ fn describe(path: &Path, error: ConfigError) -> String {
     }
 }
 
-/// Re-reads and applies the config file on each SIGHUP, as sent by `systemctl reload` or
-/// `kill -HUP`. A failed reload is logged and the old config stays.
+/// Re-reads and applies the config file, logging the outcome; on failure, the old config stays.
+fn reload(path: &Path, reloader: &Reloader) -> Result<(), String> {
+    let result = Config::load(path)
+        .map_err(|e| describe(path, e))
+        .and_then(|config| reloader.reload(&config).map_err(|e| e.to_string()));
+    match &result {
+        Ok(()) => tracing::info!("reloaded {}", path.display()),
+        Err(e) => tracing::error!("reload failed: {e}"),
+    }
+    result
+}
+
+/// Reloads on each SIGHUP, as sent by `systemctl reload` or `kill -HUP`.
 #[cfg(unix)]
 async fn reload_on_hangup(
     mut hangups: tokio::signal::unix::Signal,
@@ -101,13 +150,8 @@ async fn reload_on_hangup(
     reloader: Reloader,
 ) {
     while hangups.recv().await.is_some() {
-        let result = Config::load(&path)
-            .map_err(|e| describe(&path, e))
-            .and_then(|config| reloader.reload(&config).map_err(|e| e.to_string()));
-        match result {
-            Ok(()) => tracing::info!("reloaded {}", path.display()),
-            Err(e) => tracing::error!("reload failed: {e}"),
-        }
+        // `reload` logs the outcome, and there's no one else to tell.
+        let _ = reload(&path, &reloader);
     }
 }
 

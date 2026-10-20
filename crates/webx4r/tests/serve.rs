@@ -172,9 +172,10 @@ fn sighup_reloads_the_config_file() {
 #[cfg(unix)]
 #[test]
 fn sigterm_shuts_down_cleanly() {
-    let (_dir, config) = site();
+    let (dir, config) = site();
     let (mut child, mut stderr) = serve(&config);
     listening_addr(&mut stderr, "http");
+    assert!(dir.path().join("webx4r.sock").exists(), "control socket next to the config");
 
     send_signal(&child, "TERM");
     let status = child.wait().unwrap();
@@ -182,6 +183,53 @@ fn sigterm_shuts_down_cleanly() {
     stderr.read_to_string(&mut rest).unwrap();
     assert!(status.success(), "{status}: {rest}");
     assert!(rest.contains("shutting down") && rest.contains("stopped"), "{rest}");
+    assert!(!dir.path().join("webx4r.sock").exists(), "control socket removed on exit");
+}
+
+/// Runs `webx4r reload --config <config>`.
+fn reload(config: &Path) -> (Option<i32>, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_webx4r"))
+        .args(["reload", "--config"])
+        .arg(config)
+        .output()
+        .unwrap();
+    (output.status.code(), String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+#[test]
+fn reload_command_applies_the_config_file() {
+    let (dir, config) = site();
+    fs::create_dir(dir.path().join("www2")).unwrap();
+    fs::write(dir.path().join("www2/index.html"), "reloaded site").unwrap();
+    let (mut child, mut stderr) = serve(&config);
+    let addr = listening_addr(&mut stderr, "http").0;
+
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(&config, text.replace("\"www\"", "\"www2\"")).unwrap();
+    let (applied, applied_log) = reload(&config);
+    let reloaded = get(&addr);
+
+    // Valid to parse, so only the server can tell it's wrong.
+    fs::write(&config, text.replace("\"www\"", "\"missing\"")).unwrap();
+    let (refused, refused_log) = reload(&config);
+    let kept = get(&addr);
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    assert_eq!(applied, Some(0), "{applied_log}");
+    assert!(applied_log.contains("reloaded"), "{applied_log}");
+    assert!(reloaded.ends_with("reloaded site"), "{reloaded}");
+    assert_eq!(refused, Some(1), "{refused_log}");
+    assert!(refused_log.contains("reload failed: site 1: can't open root"), "{refused_log}");
+    assert!(kept.ends_with("reloaded site"), "a failed reload keeps the old config: {kept}");
+}
+
+#[test]
+fn reload_without_a_server_says_so() {
+    let (_dir, config) = site();
+    let (code, log) = reload(&config);
+    assert_eq!(code, Some(1));
+    assert!(log.contains("is it running?"), "{log}");
 }
 
 #[test]
