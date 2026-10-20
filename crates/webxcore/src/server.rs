@@ -27,6 +27,7 @@ use webxlib::body::Body;
 use webxlib::pages;
 use webxlib::static_files::StaticFiles;
 
+use crate::acme::{ACME_TLS_ALPN, Challenges};
 use crate::config::{self, Config};
 use crate::proxy::{self, Peer, Route};
 use crate::tls::CertStore;
@@ -46,6 +47,8 @@ pub struct Server {
     http: Option<Listener>,
     https: Option<Listener>,
     reloader: Reloader,
+    /// Present with `[acme]`.
+    challenges: Option<Arc<Challenges>>,
 }
 
 /// Applies a new config to a running [`Server`].
@@ -103,8 +106,9 @@ impl Server {
     pub async fn bind(config: &Config) -> io::Result<Self> {
         let client = proxy::Client::default();
         let router = Arc::new(ArcSwap::from_pointee(Router::new(config, client.clone())?));
+        let challenges = config.acme.as_ref().map(|_| Arc::new(Challenges::default()));
         let certs = match config.server.https {
-            Some(_) => Some(Arc::new(CertStore::new(config)?)),
+            Some(_) => Some(Arc::new(CertStore::new(config, challenges.clone())?)),
             None => None,
         };
         let https = match (config.server.https, &certs) {
@@ -122,7 +126,7 @@ impl Server {
             Some((addr, acceptor)) => Some(Listener::bind(addr, Some(acceptor)).await?),
             None => None,
         };
-        Ok(Self { http, https, reloader })
+        Ok(Self { http, https, reloader, challenges })
     }
 
     /// A handle for reloading the config while [`Server::run`] serves.
@@ -186,6 +190,7 @@ impl Server {
             let conn = Connection {
                 peer: Peer { addr: peer, https: listener.tls.is_some() },
                 router: Arc::clone(&self.reloader.router),
+                challenges: self.challenges.clone(),
                 builder: Arc::clone(builder),
                 watcher: graceful.watcher(),
             };
@@ -195,6 +200,12 @@ impl Server {
                 Some(acceptor) => tokio::spawn(async move {
                     let handshake = acceptor.accept(stream);
                     match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, handshake).await {
+                        // The handshake is the whole TLS-ALPN-01 answer (RFC 8737 §3).
+                        Ok(Ok(stream))
+                            if stream.get_ref().1.alpn_protocol() == Some(ACME_TLS_ALPN) =>
+                        {
+                            tracing::debug!(%peer, "answered a TLS-ALPN-01 challenge");
+                        }
                         Ok(Ok(stream)) => conn.serve(stream).await,
                         Ok(Err(e)) => tracing::debug!(%peer, error = %e, "TLS handshake failed"),
                         Err(_) => tracing::debug!(%peer, "TLS handshake timed out"),
@@ -209,6 +220,7 @@ impl Server {
 struct Connection {
     peer: Peer,
     router: Arc<ArcSwap<Router>>,
+    challenges: Option<Arc<Challenges>>,
     builder: Arc<ConnBuilder>,
     /// Held from accept, so shutdown also waits for handshakes in progress.
     watcher: Watcher,
@@ -219,10 +231,16 @@ impl Connection {
     where
         I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let Self { peer, router, builder, watcher } = self;
+        let Self { peer, router, challenges, builder, watcher } = self;
         let service = service_fn(move |req| {
+            let answer = challenges.as_ref().and_then(|challenges| challenges.http_response(&req));
             let router = router.load_full();
-            async move { Ok::<_, Infallible>(router.handle(req, peer).await) }
+            async move {
+                Ok::<_, Infallible>(match answer {
+                    Some(res) => res,
+                    None => router.handle(req, peer).await,
+                })
+            }
         });
         let conn = builder.serve_connection_with_upgrades(TokioIo::new(io), service);
         if let Err(e) = watcher.watch(conn.into_owned()).await {

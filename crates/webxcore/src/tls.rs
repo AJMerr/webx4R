@@ -15,20 +15,28 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 
+use crate::acme::{ACME_TLS_ALPN, Challenges};
 use crate::config::{Config, is_localhost};
+
+/// The crypto backend for every certificate and handshake.
+pub(crate) fn provider() -> CryptoProvider {
+    rustls::crypto::aws_lc_rs::default_provider()
+}
 
 /// The live certificates, which rustls asks for on every handshake.
 #[derive(Debug)]
 pub struct CertStore {
     provider: Arc<CryptoProvider>,
     current: ArcSwap<Certs>,
+    /// Present with `[acme]`, to answer TLS-ALPN-01 challenges.
+    challenges: Option<Arc<Challenges>>,
 }
 
 impl CertStore {
-    pub fn new(config: &Config) -> io::Result<Self> {
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    pub fn new(config: &Config, challenges: Option<Arc<Challenges>>) -> io::Result<Self> {
+        let provider = Arc::new(provider());
         let certs = Certs::new(config, &provider, None)?;
-        Ok(Self { provider, current: ArcSwap::from_pointee(certs) })
+        Ok(Self { provider, current: ArcSwap::from_pointee(certs), challenges })
     }
 
     /// Loads `config`'s certificates without applying them; see [`CertStore::store`].
@@ -41,7 +49,7 @@ impl CertStore {
     }
 
     /// rustls settings for the HTTPS listener: TLS 1.2 and 1.3, certs from this store by SNI,
-    /// h2 or HTTP/1.1 by ALPN.
+    /// h2 or HTTP/1.1 by ALPN, and `acme-tls/1` with challenges.
     pub fn server_config(self: &Arc<Self>) -> ServerConfig {
         let mut tls = ServerConfig::builder_with_provider(Arc::clone(&self.provider))
             .with_safe_default_protocol_versions()
@@ -49,13 +57,20 @@ impl CertStore {
             .with_no_client_auth()
             .with_cert_resolver(Arc::clone(self) as Arc<dyn ResolvesServerCert>);
         tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        if self.challenges.is_some() {
+            tls.alpn_protocols.push(ACME_TLS_ALPN.to_vec());
+        }
         tls
     }
 }
 
 impl ResolvesServerCert for CertStore {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        self.current.load().lookup(hello.server_name())
+        let acme = hello.alpn().is_some_and(|mut protocols| protocols.any(|p| p == ACME_TLS_ALPN));
+        match &self.challenges {
+            Some(challenges) if acme => challenges.tls_alpn_cert(hello.server_name()?),
+            _ => self.current.load().lookup(hello.server_name()),
+        }
     }
 }
 
@@ -297,7 +312,7 @@ pub(crate) mod tests {
         let local = |hosts: &str| {
             config(dir.path(), &format!("[[site]]\nhosts = [{hosts}]\nroot = \"www\"\n"))
         };
-        let store = CertStore::new(&local("\"localhost\"")).unwrap();
+        let store = CertStore::new(&local("\"localhost\""), None).unwrap();
         let first = store.current.load().lookup(Some("localhost")).unwrap();
 
         store.store(store.load(&local("\"localhost\"")).unwrap());
@@ -315,7 +330,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_pair(dir.path(), "a.test");
         let sites = config(dir.path(), &site("a.test", "a.test", false));
-        let store = CertStore::new(&sites).unwrap();
+        let store = CertStore::new(&sites, None).unwrap();
 
         let (renewed, _) = write_pair(dir.path(), "a.test");
         store.store(store.load(&sites).unwrap());

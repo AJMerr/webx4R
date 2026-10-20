@@ -24,6 +24,7 @@ struct Running {
     stop: Option<oneshot::Sender<()>>,
     done: tokio::task::JoinHandle<()>,
     reloader: Reloader,
+    challenges: Option<Arc<Challenges>>,
     /// The config text the server started with.
     config: String,
     dir: TempDir,
@@ -45,6 +46,11 @@ impl Running {
 
     /// HTTPS with a self-signed cert per site, plus HTTP if `with_http`.
     async fn start_tls(with_http: bool) -> Self {
+        Self::start_tls_with(with_http, "").await
+    }
+
+    /// Like [`Running::start_tls`], with `extra` added to the config.
+    async fn start_tls_with(with_http: bool, extra: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         write_pair(dir.path(), "a.test");
         write_pair(dir.path(), "b.test");
@@ -52,7 +58,8 @@ impl Running {
         let text = format!(
             "[server]\n{http}https = \"127.0.0.1:0\"\n\
              [[site]]\nhosts = [\"a.test\"]\nroot = \"a\"\ncert = \"a.test.crt\"\nkey = \"a.test.key\"\n\
-             [[site]]\nhosts = [\"b.test\"]\nroot = \"b\"\ncert = \"b.test.crt\"\nkey = \"b.test.key\"\n"
+             [[site]]\nhosts = [\"b.test\"]\nroot = \"b\"\ncert = \"b.test.crt\"\nkey = \"b.test.key\"\n\
+             {extra}"
         );
         Self::start_with(dir, &text).await
     }
@@ -67,11 +74,13 @@ impl Running {
         let server = Server::bind(&config).await.unwrap();
         let (http, https) = (server.http_addr(), server.https_addr());
         let reloader = server.reloader();
+        let challenges = server.challenges.clone();
         let (stop, stopped) = oneshot::channel();
         let done = tokio::spawn(server.run(async {
             let _ = stopped.await;
         }));
-        Self { http, https, stop: Some(stop), done, reloader, config: text.to_owned(), dir }
+        let config = text.to_owned();
+        Self { http, https, stop: Some(stop), done, reloader, challenges, config, dir }
     }
 
     /// Reloads with `config`, resolved against the same folder as the first one.
@@ -444,6 +453,105 @@ async fn failed_handshake_leaves_the_listener_running() {
 
     let (_, body) = get_tls(server.tls("a.test", b"h2").await, "a.test").await;
     assert_eq!(body, "site a");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn answers_http01_challenges_before_sites() {
+    let path = "/.well-known/acme-challenge/tok";
+    let plain = Running::start(false).await;
+    assert!(plain.get_path("a.test", path).await.starts_with("HTTP/1.1 404"), "no [acme]");
+    plain.stop().await;
+
+    let server = Running::start_tls_with(true, "[acme]\n").await;
+    server.challenges.as_ref().unwrap().add_http("tok", "tok.thumbprint");
+    let res = server.get_path("a.test", path).await;
+    assert!(res.starts_with("HTTP/1.1 200") && res.ends_with("\r\n\r\ntok.thumbprint"), "{res}");
+    let other = server.get_path("a.test", "/.well-known/acme-challenge/other").await;
+    assert!(other.starts_with("HTTP/1.1 404"), "unknown tokens go to the site: {other}");
+    server.stop().await;
+}
+
+/// Accepts any server cert, for reading what a TLS-ALPN-01 handshake presents. It skips
+/// signature checks too: rustls's parser rejects the critical acmeIdentifier extension.
+#[derive(Debug)]
+struct AcceptAny;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAny {
+    fn verify_server_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        crate::tls::provider().signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// Connects like a CA checking TLS-ALPN-01: SNI `host`, offering only `acme-tls/1`.
+async fn acme_handshake(addr: SocketAddr, host: &str) -> io::Result<TlsStream<TcpStream>> {
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAny))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![ACME_TLS_ALPN.to_vec()];
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let name = ServerName::try_from(host.to_owned()).unwrap();
+    TlsConnector::from(Arc::new(config)).connect(name, tcp).await
+}
+
+#[tokio::test]
+async fn answers_tls_alpn01_challenges_then_closes() {
+    let server = Running::start_tls_with(false, "[acme]\n").await;
+    let challenges = server.challenges.as_ref().unwrap();
+    challenges.add_tls_alpn("a.test", &[7; 32]).unwrap();
+
+    let mut stream = acme_handshake(server.https.unwrap(), "a.test").await.unwrap();
+    let (_, tls) = stream.get_ref();
+    assert_eq!(tls.alpn_protocol(), Some(ACME_TLS_ALPN));
+    let expected = &challenges.tls_alpn_cert("a.test").unwrap().cert[0];
+    assert_eq!(&tls.peer_certificates().unwrap()[0], expected);
+    // The server closes the connection; a reset instead of a clean close is fine.
+    let read = stream.read(&mut [0; 1]).await;
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+
+    assert!(acme_handshake(server.https.unwrap(), "b.test").await.is_err(), "no challenge");
+    let (_, body) = get_tls(server.tls("a.test", b"h2").await, "a.test").await;
+    assert_eq!(body, "site a", "other clients still get the site's cert");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn acme_tls_alpn_is_refused_without_acme() {
+    let server = Running::start_tls(false).await;
+    assert!(acme_handshake(server.https.unwrap(), "a.test").await.is_err());
     server.stop().await;
 }
 

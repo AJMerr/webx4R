@@ -1,15 +1,101 @@
-//! Automatic certificates over ACME (RFC 8555): the account, and the files it keeps.
+//! Automatic certificates over ACME (RFC 8555): the account, the files it keeps, and the
+//! answers to the CA's challenges.
 
 #[cfg(test)]
 pub(crate) mod tests;
 
+use std::collections::HashMap;
+use std::fmt::Display;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
+use http::header::CONTENT_TYPE;
+use http::{Method, Request, Response};
 use instant_acme::{Account, AccountBuilder, AccountCredentials, NewAccount};
+use rustls::pki_types::PrivatePkcs8KeyDer;
+use rustls::sign::CertifiedKey;
+use webxlib::body::Body;
 
 use crate::config::Acme;
+use crate::tls;
+
+/// The ALPN protocol of TLS-ALPN-01 challenges (RFC 8737).
+pub const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
+
+const HTTP_CHALLENGE_PATH: &str = "/.well-known/acme-challenge/";
+
+/// Answers to pending challenges, which prove to the CA that we control a hostname.
+#[derive(Debug, Default)]
+pub struct Challenges {
+    /// HTTP-01: key authorizations by token.
+    http: Mutex<HashMap<String, String>>,
+    /// TLS-ALPN-01: challenge certs by hostname.
+    tls_alpn: Mutex<HashMap<String, Arc<CertifiedKey>>>,
+}
+
+impl Challenges {
+    pub fn add_http(&self, token: &str, key_authorization: &str) {
+        self.http.lock().unwrap().insert(token.to_owned(), key_authorization.to_owned());
+    }
+
+    pub fn remove_http(&self, token: &str) {
+        self.http.lock().unwrap().remove(token);
+    }
+
+    /// `digest` is the SHA-256 of the key authorization.
+    pub fn add_tls_alpn(&self, host: &str, digest: &[u8]) -> io::Result<()> {
+        let certified = Arc::new(tls_alpn_cert(host, digest)?);
+        self.tls_alpn.lock().unwrap().insert(host.to_owned(), certified);
+        Ok(())
+    }
+
+    pub fn remove_tls_alpn(&self, host: &str) {
+        self.tls_alpn.lock().unwrap().remove(host);
+    }
+
+    /// The HTTP-01 answer, if `req` asks for a pending token. Other requests under the
+    /// challenge path go to the site, so other ACME clients can still use it.
+    pub fn http_response<B>(&self, req: &Request<B>) -> Option<Response<Body>> {
+        let token = req.uri().path().strip_prefix(HTTP_CHALLENGE_PATH)?;
+        if req.method() != Method::GET {
+            return None;
+        }
+        let key_authorization = self.http.lock().unwrap().get(token)?.clone();
+        let res = Response::builder()
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(Body::bytes(key_authorization))
+            .expect("static header is valid");
+        Some(res)
+    }
+
+    /// The TLS-ALPN-01 cert for `host`; `None` aborts the handshake.
+    pub fn tls_alpn_cert(&self, host: &str) -> Option<Arc<CertifiedKey>> {
+        let host = host.strip_suffix('.').unwrap_or(host);
+        self.tls_alpn.lock().unwrap().get(host).cloned()
+    }
+}
+
+/// A self-signed cert for `host` with the critical acmeIdentifier extension (RFC 8737 §3).
+fn tls_alpn_cert(host: &str, digest: &[u8]) -> io::Result<CertifiedKey> {
+    let error = |e: &dyn Display| {
+        let msg = format!("can't make a TLS-ALPN-01 cert for {host}: {e}");
+        io::Error::new(io::ErrorKind::InvalidData, msg)
+    };
+    if digest.len() != 32 {
+        return Err(error(&"the digest must be a SHA-256"));
+    }
+    let mut params = rcgen::CertificateParams::new(vec![host.to_owned()]).map_err(|e| error(&e))?;
+    params.custom_extensions = vec![rcgen::CustomExtension::new_acme_identifier(digest)];
+    let key = rcgen::KeyPair::generate().map_err(|e| error(&e))?;
+    let cert = params.self_signed(&key).map_err(|e| error(&e))?;
+    let key = PrivatePkcs8KeyDer::from(key.serialize_der());
+    // Not `CertifiedKey::from_der`: its parser rejects the critical acmeIdentifier extension.
+    let signer =
+        tls::provider().key_provider.load_private_key(key.into()).map_err(|e| error(&e))?;
+    Ok(CertifiedKey::new(vec![cert.der().clone()], signer))
+}
 
 /// The files kept for one CA: its account and the certificates it issued.
 pub struct Storage {

@@ -87,6 +87,49 @@ fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
+#[tokio::test]
+async fn http_challenges_answer_pending_tokens() {
+    use http_body_util::BodyExt;
+
+    let challenges = Challenges::default();
+    challenges.add_http("tok", "tok.thumbprint");
+    let req =
+        |method: Method, path: &str| Request::builder().method(method).uri(path).body(()).unwrap();
+    let path = "/.well-known/acme-challenge/tok";
+
+    let res = challenges.http_response(&req(Method::GET, path)).unwrap();
+    assert_eq!(res.headers()[CONTENT_TYPE], "application/octet-stream");
+    assert_eq!(res.into_body().collect().await.unwrap().to_bytes(), "tok.thumbprint");
+    assert!(challenges.http_response(&req(Method::POST, path)).is_none());
+    assert!(
+        challenges.http_response(&req(Method::GET, "/.well-known/acme-challenge/other")).is_none()
+    );
+    assert!(challenges.http_response(&req(Method::GET, "/tok")).is_none());
+
+    challenges.remove_http("tok");
+    assert!(challenges.http_response(&req(Method::GET, path)).is_none());
+}
+
+#[test]
+fn tls_alpn_certs_carry_the_digest() {
+    let challenges = Challenges::default();
+    let digest = [7; 32];
+    challenges.add_tls_alpn("a.test", &digest).unwrap();
+    let certified = challenges.tls_alpn_cert("a.test.").unwrap();
+
+    // acmeIdentifier's OID (1.3.6.1.5.5.7.1.31), critical, then the digest as a nested
+    // OCTET STRING (RFC 8737 §3).
+    let mut extension = vec![0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x1f];
+    extension.extend([0x01, 0x01, 0xff, 0x04, 0x22, 0x04, 0x20]);
+    extension.extend(digest);
+    let der = certified.cert[0].as_ref();
+    assert!(der.windows(extension.len()).any(|window| window == extension));
+
+    assert!(challenges.tls_alpn_cert("b.test").is_none());
+    challenges.remove_tls_alpn("a.test");
+    assert!(challenges.tls_alpn_cert("a.test").is_none());
+}
+
 #[test]
 fn storage_is_named_after_the_directory() {
     let root = Path::new("/state");
