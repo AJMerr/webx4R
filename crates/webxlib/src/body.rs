@@ -1,4 +1,5 @@
-//! Response body: empty, in-memory bytes, a file streamed from disk, or any stream of known length.
+//! Response body: empty, in-memory bytes, a file streamed from disk, any stream of known length,
+//! or another body passed through as is.
 
 use std::io;
 use std::pin::Pin;
@@ -7,6 +8,8 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use futures_core::Stream;
 use http_body::{Frame, SizeHint};
+use http_body_util::BodyExt;
+use http_body_util::combinators::UnsyncBoxBody;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, Take};
 use tokio_util::io::ReaderStream;
@@ -14,7 +17,7 @@ use tokio_util::io::ReaderStream;
 /// Read size for file bodies; larger chunks mean fewer syscalls per response.
 const FILE_CHUNK: usize = 64 * 1024;
 
-/// An [`http_body::Body`] with an exact size known up front.
+/// An [`http_body::Body`]. All kinds except [`Body::boxed`] have an exact size known up front.
 pub struct Body(Kind);
 
 type BoxStream = Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>;
@@ -24,6 +27,7 @@ enum Kind {
     Bytes(Option<Bytes>),
     File { stream: ReaderStream<Take<File>>, remaining: u64 },
     Stream { stream: BoxStream, remaining: u64 },
+    Boxed(UnsyncBoxBody<Bytes, io::Error>),
 }
 
 impl Body {
@@ -54,6 +58,15 @@ impl Body {
     ) -> Self {
         Self(Kind::Stream { stream: Box::pin(stream), remaining: len })
     }
+
+    /// Passes `body` through frame by frame, trailers included, e.g. an upstream's response.
+    pub fn boxed<B>(body: B) -> Self
+    where
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        Self(Kind::Boxed(body.map_err(io::Error::other).boxed_unsync()))
+    }
 }
 
 impl http_body::Body for Body {
@@ -69,6 +82,7 @@ impl http_body::Body for Body {
             Kind::Bytes(bytes) => Poll::Ready(bytes.take().map(|b| Ok(Frame::data(b)))),
             Kind::File { stream, remaining } => poll_sized(Pin::new(stream), remaining, cx),
             Kind::Stream { stream, remaining } => poll_sized(stream.as_mut(), remaining, cx),
+            Kind::Boxed(body) => Pin::new(body).poll_frame(cx),
         }
     }
 
@@ -77,6 +91,7 @@ impl http_body::Body for Body {
             Kind::Empty => true,
             Kind::Bytes(bytes) => bytes.is_none(),
             Kind::File { remaining, .. } | Kind::Stream { remaining, .. } => *remaining == 0,
+            Kind::Boxed(body) => body.is_end_stream(),
         }
     }
 
@@ -89,6 +104,7 @@ impl http_body::Body for Body {
             Kind::File { remaining, .. } | Kind::Stream { remaining, .. } => {
                 SizeHint::with_exact(*remaining)
             }
+            Kind::Boxed(body) => body.size_hint(),
         }
     }
 }
@@ -126,8 +142,9 @@ fn poll_sized<S: Stream<Item = io::Result<Bytes>> + ?Sized>(
 mod tests {
     use std::io::Write;
 
+    use http::{HeaderMap, HeaderValue};
     use http_body::Body as _;
-    use http_body_util::BodyExt;
+    use http_body_util::StreamBody;
 
     use super::*;
 
@@ -199,5 +216,29 @@ mod tests {
     async fn stream_longer_than_len_is_an_error() {
         let err = Body::stream(chunks(&["ab", "cd"]), 3).collect().await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn boxed_body_passes_frames_through() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert("x-checksum", HeaderValue::from_static("abc"));
+        let frames =
+            [Ok::<_, io::Error>(Frame::data(Bytes::from("ab"))), Ok(Frame::trailers(trailers))];
+        let body = Body::boxed(StreamBody::new(futures_util::stream::iter(frames)));
+        assert_eq!(body.size_hint().exact(), None);
+
+        let collected = body.collect().await.unwrap();
+        assert_eq!(collected.trailers().unwrap()["x-checksum"], "abc");
+        assert_eq!(collected.to_bytes(), "ab");
+    }
+
+    #[tokio::test]
+    async fn boxed_body_passes_errors_through() {
+        let frames = [Err::<Frame<Bytes>, _>(io::Error::other("upstream reset"))];
+        let err = Body::boxed(StreamBody::new(futures_util::stream::iter(frames)))
+            .collect()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("upstream reset"), "{err}");
     }
 }
