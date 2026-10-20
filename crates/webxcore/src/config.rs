@@ -4,17 +4,22 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use webxlib::static_files::{PathPolicy, Symlinks};
+
+const LETS_ENCRYPT: &str = "https://acme-v02.api.letsencrypt.org/directory";
+const LETS_ENCRYPT_STAGING: &str = "https://acme-staging-v02.api.letsencrypt.org/directory";
 
 /// A validated config.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub server: Server,
+    /// Automatic certificates; see [`Site::acme_hosts`] for which names get one.
+    pub acme: Option<Acme>,
     #[serde(rename = "site", default)]
     pub sites: Vec<Site>,
     /// The folder relative paths resolve against: the config file's folder.
@@ -32,6 +37,19 @@ pub struct Server {
     /// Control socket path on Unix, pipe name (`\\.\pipe\…`) on Windows; resolved like `root`.
     /// See [`Config::control_endpoint`] for the default.
     pub control: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Acme {
+    /// Contact address the CA may use for notices about the account.
+    pub email: Option<String>,
+    /// `production` (the default) or `staging` for Let's Encrypt, or another CA's
+    /// directory URL; see [`Acme::directory_url`].
+    pub directory: Option<String>,
+    /// Folder for the account key and certificates; resolved like `root`.
+    /// See [`Config::acme_storage`] for the default.
+    pub storage: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -81,10 +99,30 @@ pub enum SymlinkSetting {
     Deny,
 }
 
+impl Acme {
+    pub fn directory_url(&self) -> &str {
+        match self.directory.as_deref() {
+            None | Some("production") => LETS_ENCRYPT,
+            Some("staging") => LETS_ENCRYPT_STAGING,
+            Some(url) => url,
+        }
+    }
+}
+
 impl Site {
-    /// Whether HTTPS can serve this site: it has cert files, or a localhost name to self-sign.
-    pub fn has_tls(&self) -> bool {
-        self.cert.is_some() || self.hosts.iter().any(|host| is_localhost(host))
+    /// Whether HTTPS can serve this site: it has cert files, a localhost name to self-sign,
+    /// or, when `acme` is on, a name to request a cert for.
+    pub fn has_tls(&self, acme: bool) -> bool {
+        self.cert.is_some()
+            || self.hosts.iter().any(|host| is_localhost(host))
+            || (acme && self.acme_hosts().next().is_some())
+    }
+
+    /// The names ACME requests a cert for: none if the site has cert files, otherwise its
+    /// hosts that aren't localhost or IP addresses.
+    pub fn acme_hosts(&self) -> impl Iterator<Item = &String> {
+        let hosts: &[String] = if self.cert.is_some() { &[] } else { &self.hosts };
+        hosts.iter().filter(|host| !is_localhost(host) && host.parse::<IpAddr>().is_err())
     }
 
     pub fn policy(&self) -> PathPolicy {
@@ -135,6 +173,9 @@ impl Config {
             // Pipe names are absolute paths on Windows, so `join` leaves them as they are.
             *control = base.join(&*control);
         }
+        if let Some(storage) = config.acme.as_mut().and_then(|acme| acme.storage.as_mut()) {
+            *storage = base.join(&*storage);
+        }
         for site in &mut config.sites {
             for path in [&mut site.root, &mut site.cert, &mut site.key].into_iter().flatten() {
                 *path = base.join(&*path);
@@ -160,10 +201,25 @@ impl Config {
         }
     }
 
+    /// Where ACME keeps its account key and certificates: `[acme] storage`, or the default
+    /// from [`default_acme_storage`].
+    pub fn acme_storage(&self) -> PathBuf {
+        match self.acme.as_ref().and_then(|acme| acme.storage.clone()) {
+            Some(storage) => storage,
+            None => default_acme_storage(&self.dir, std::env::var_os),
+        }
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         let invalid = |msg: String| Err(ConfigError::Invalid(msg));
         if self.server.http.is_none() && self.server.https.is_none() {
             return invalid("[server] needs `http`, `https` or both".into());
+        }
+        if let Some(acme) = &self.acme {
+            if self.server.https.is_none() {
+                return invalid("[acme] needs `https` in [server]".into());
+            }
+            validate_acme(acme)?;
         }
         if self.sites.is_empty() {
             return invalid("config needs at least one [[site]]".into());
@@ -206,13 +262,34 @@ impl Config {
                 }
             }
         }
-        if self.server.https.is_some() && !self.sites.iter().any(Site::has_tls) {
+        let acme = self.acme.is_some();
+        if self.server.https.is_some() && !self.sites.iter().any(|site| site.has_tls(acme)) {
             return invalid(
-                "[server] has `https`, but no site has a `cert` or a localhost host".into(),
+                "[server] has `https`, but no site has a `cert`, a localhost host, \
+                 or a public host with [acme]"
+                    .into(),
             );
         }
         Ok(())
     }
+}
+
+fn validate_acme(acme: &Acme) -> Result<(), ConfigError> {
+    let invalid = |msg: String| Err(ConfigError::Invalid(msg));
+    if let Some(email) = &acme.email {
+        let address = email.split_once('@').filter(|(user, domain)| {
+            !user.is_empty() && is_hostname(domain) && !user.contains(char::is_whitespace)
+        });
+        if address.is_none() {
+            return invalid(format!("[acme] email \"{email}\" isn't an email address"));
+        }
+    }
+    if !acme.directory_url().starts_with("https://") {
+        return invalid(
+            "[acme] directory must be `production`, `staging` or an https:// URL".into(),
+        );
+    }
+    Ok(())
 }
 
 fn validate_proxies(n: usize, proxies: &[Proxy]) -> Result<(), ConfigError> {
@@ -254,21 +331,46 @@ fn is_upstream(addr: &str) -> bool {
 /// - Unix: `$XDG_RUNTIME_DIR/webx4r-<hash>.sock`, a short per-user path; socket paths are
 ///   limited to about 100 bytes. Without that variable, `webx4r.sock` in `dir`.
 fn default_control_endpoint(dir: &Path, runtime_dir: Option<OsString>) -> PathBuf {
-    let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
-    let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_owned());
-    let key = dir.to_string_lossy();
+    let (dir, hash) = config_folder(dir);
     if cfg!(windows) {
-        // Windows paths ignore case, so differently-cased spellings must name one pipe.
-        let hash = fnv1a(key.to_lowercase().as_bytes());
         return PathBuf::from(format!(r"\\.\pipe\webx4r-{hash:016x}"));
     }
     match runtime_dir.map(PathBuf::from) {
         // The XDG spec says to ignore a relative value.
         Some(runtime_dir) if runtime_dir.is_absolute() => {
-            runtime_dir.join(format!("webx4r-{:016x}.sock", fnv1a(key.as_bytes())))
+            runtime_dir.join(format!("webx4r-{hash:016x}.sock"))
         }
         _ => dir.join("webx4r.sock"),
     }
+}
+
+/// `webx4r/<hash>/acme` in the per-user state folder, named after the config folder `dir`:
+/// `%LOCALAPPDATA%` on Windows, else `$XDG_STATE_HOME` or `~/.local/state`.
+/// Without those, `webx4r-acme` in `dir`. `var` reads an environment variable.
+fn default_acme_storage(dir: &Path, var: impl Fn(&'static str) -> Option<OsString>) -> PathBuf {
+    let (dir, hash) = config_folder(dir);
+    // The XDG spec says to ignore relative values.
+    let absolute = |name| var(name).map(PathBuf::from).filter(|path| path.is_absolute());
+    let state = if cfg!(windows) {
+        absolute("LOCALAPPDATA")
+    } else {
+        absolute("XDG_STATE_HOME").or_else(|| Some(absolute("HOME")?.join(".local/state")))
+    };
+    match state {
+        Some(state) => state.join("webx4r").join(format!("{hash:016x}")).join("acme"),
+        None => dir.join("webx4r-acme"),
+    }
+}
+
+/// `dir` made absolute, and its hash for naming per-config files and folders.
+fn config_folder(dir: &Path) -> (PathBuf, u64) {
+    let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+    let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_owned());
+    let key = dir.to_string_lossy();
+    // Windows paths ignore case, so differently-cased spellings must hash alike.
+    let key = if cfg!(windows) { key.to_lowercase() } else { key.into_owned() };
+    let hash = fnv1a(key.as_bytes());
+    (dir, hash)
 }
 
 /// 64-bit FNV-1a: a hash that stays the same across Rust versions, unlike `DefaultHasher`,
@@ -437,7 +539,7 @@ mod tests {
         let site = &config.sites[0];
         assert_eq!(site.cert.as_deref(), Some(Path::new("/etc/webx4r/certs/a.crt")));
         assert_eq!(site.key.as_deref(), Some(Path::new("/keys/a.key")));
-        assert!(site.has_tls());
+        assert!(site.has_tls(false));
     }
 
     #[test]
@@ -457,11 +559,75 @@ mod tests {
     #[test]
     fn https_needs_a_site_with_tls() {
         let msg = invalid(&with_tls(HTTPS, ""));
-        assert_eq!(msg, "[server] has `https`, but no site has a `cert` or a localhost host");
+        assert_eq!(
+            msg,
+            "[server] has `https`, but no site has a `cert`, a localhost host, \
+             or a public host with [acme]"
+        );
         for host in ["localhost", "app.localhost"] {
             let config = parse(&with_tls(HTTPS, "").replace("example.com", host)).unwrap();
-            assert!(config.sites[0].has_tls(), "{host}");
+            assert!(config.sites[0].has_tls(false), "{host}");
         }
+        let config = parse(&(with_tls(HTTPS, "") + ACME)).unwrap();
+        assert!(config.sites[0].has_tls(true), "ACME covers example.com");
+    }
+
+    const ACME: &str = "\n[acme]\n";
+
+    #[test]
+    fn acme_settings() {
+        let acme = "email = \"me@example.com\"\ndirectory = \"staging\"\nstorage = \"state\"";
+        let config = parse(&(with_tls(HTTPS, "") + ACME + acme)).unwrap();
+        let acme = config.acme.as_ref().unwrap();
+        assert_eq!(acme.email.as_deref(), Some("me@example.com"));
+        assert_eq!(acme.directory_url(), LETS_ENCRYPT_STAGING);
+        assert_eq!(config.acme_storage(), Path::new("/etc/webx4r/state"));
+    }
+
+    #[test]
+    fn acme_defaults() {
+        let config = parse(&(with_tls(HTTPS, "") + ACME)).unwrap();
+        let acme = config.acme.as_ref().unwrap();
+        assert_eq!((acme.email.as_deref(), acme.storage.as_deref()), (None, None));
+        assert_eq!(acme.directory_url(), LETS_ENCRYPT);
+        assert_eq!(parse(MINIMAL).unwrap().acme, None, "off without [acme]");
+    }
+
+    #[test]
+    fn acme_needs_https() {
+        let msg = invalid(&(MINIMAL.to_owned() + ACME));
+        assert_eq!(msg, "[acme] needs `https` in [server]");
+    }
+
+    #[test]
+    fn acme_directory_is_validated() {
+        let url = "https://localhost:14000/dir";
+        let custom = parse(&(with_tls(HTTPS, "") + ACME + &format!("directory = \"{url}\"")));
+        assert_eq!(custom.unwrap().acme.unwrap().directory_url(), url);
+        for bad in ["http://localhost:14000/dir", "prod", ""] {
+            let msg = invalid(&(with_tls(HTTPS, "") + ACME + &format!("directory = \"{bad}\"")));
+            assert!(msg.contains("must be `production`, `staging`"), "{bad}: {msg}");
+        }
+    }
+
+    #[test]
+    fn acme_email_is_validated() {
+        for bad in ["me", "@example.com", "me@", "me @example.com", "me@exa mple.com"] {
+            let msg = invalid(&(with_tls(HTTPS, "") + ACME + &format!("email = \"{bad}\"")));
+            assert!(msg.ends_with("isn't an email address"), "{bad}: {msg}");
+        }
+    }
+
+    #[test]
+    fn acme_hosts_skip_localhost_ips_and_cert_files() {
+        let hosts = "\"example.com\", \"localhost\", \"127.0.0.1\", \"www.example.com\"";
+        let text = with_tls(HTTPS, "").replace("\"example.com\"", hosts) + ACME;
+        let config = parse(&text).unwrap();
+        let names: Vec<_> = config.sites[0].acme_hosts().collect();
+        assert_eq!(names, ["example.com", "www.example.com"]);
+
+        let config = parse(&(with_tls(HTTPS, CERT) + ACME)).unwrap();
+        assert_eq!(config.sites[0].acme_hosts().count(), 0, "cert files take priority");
     }
 
     #[test]
@@ -559,6 +725,39 @@ mod tests {
         assert_eq!(default_control_endpoint(dir, None), next_to_config);
         let relative = Some(OsString::from("run"));
         assert_eq!(default_control_endpoint(dir, relative), next_to_config, "relative is ignored");
+    }
+
+    /// [`default_acme_storage`] with only the environment variables in `vars` set.
+    fn acme_storage(dir: &str, vars: &[(&str, &str)]) -> PathBuf {
+        default_acme_storage(Path::new(dir), |name| {
+            vars.iter().find(|(var, _)| *var == name).map(|(_, value)| OsString::from(value))
+        })
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn default_acme_storage_is_in_local_app_data() {
+        let local = [("LOCALAPPDATA", r"C:\Users\me\AppData\Local")];
+        let a = acme_storage(r"C:\sites\a", &local);
+        assert!(a.starts_with(r"C:\Users\me\AppData\Local\webx4r") && a.ends_with("acme"), "{a:?}");
+        assert_eq!(acme_storage(r"C:\Sites\A", &local), a, "case doesn't matter");
+        assert_ne!(acme_storage(r"C:\sites\b", &local), a);
+        assert_eq!(acme_storage(r"C:\sites\a", &[]), Path::new(r"C:\sites\a\webx4r-acme"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_acme_storage_is_per_user_state() {
+        let state = [("XDG_STATE_HOME", "/state"), ("HOME", "/home/me")];
+        let a = acme_storage("/srv/a", &state);
+        let name = a.parent().unwrap().file_name().unwrap().to_str().unwrap();
+        assert_eq!(a, Path::new("/state/webx4r").join(name).join("acme"));
+        assert_eq!(name.len(), 16, "{name}");
+        assert_ne!(acme_storage("/srv/b", &state), a, "one folder per config folder");
+
+        let home = acme_storage("/srv/a", &[("XDG_STATE_HOME", "state"), ("HOME", "/home/me")]);
+        assert!(home.starts_with("/home/me/.local/state/webx4r"), "relative is ignored: {home:?}");
+        assert_eq!(acme_storage("/srv/a", &[]), Path::new("/srv/a/webx4r-acme"));
     }
 
     #[test]
