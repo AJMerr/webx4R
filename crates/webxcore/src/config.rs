@@ -285,7 +285,9 @@ impl Config {
         if self.log.as_ref().is_some_and(|log| log.keep_days == 0) {
             return invalid("[log] keep_days must be at least 1".into());
         }
+        // Port 0 picks a free port, so it can't clash.
         if let Some(Metrics { listen }) = &self.metrics
+            && listen.port() != 0
             && [self.server.http, self.server.https].contains(&Some(*listen))
         {
             return invalid(format!("[metrics] listen {listen} is already used in [server]"));
@@ -806,6 +808,8 @@ mod tests {
         assert_eq!(config.metrics.unwrap().listen, "127.0.0.1:9100".parse().unwrap());
         let msg = invalid(&format!("{MINIMAL}\n[metrics]\nlisten = \"0.0.0.0:8080\""));
         assert_eq!(msg, "[metrics] listen 0.0.0.0:8080 is already used in [server]");
+        let any_port = MINIMAL.replace("0.0.0.0:8080", "127.0.0.1:0");
+        parse(&format!("{any_port}\n[metrics]\nlisten = \"127.0.0.1:0\"")).unwrap();
     }
 
     #[test]

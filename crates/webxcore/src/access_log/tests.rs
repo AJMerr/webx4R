@@ -1,6 +1,3 @@
-use std::sync::Mutex;
-
-use http_body_util::BodyExt;
 use serde_json::{Value, json};
 
 use super::*;
@@ -29,14 +26,14 @@ fn entry(format: AccessFormat) -> Entry {
     Entry {
         log: Arc::new(AccessLog::new(format, |_| {})),
         started: Started::new(&req, "::ffff:192.0.2.1".parse().unwrap()),
-        status: StatusCode::OK,
         upstream: Some("127.0.0.1:3000".into()),
-        bytes: 1234,
     }
 }
 
+/// `entry`'s line for a 200 with 1234 body bytes.
 fn line(entry: &Entry) -> String {
-    String::from_utf8(entry.line(at(1_700_000_000, 474), Duration::from_micros(1_500))).unwrap()
+    let (now, elapsed) = (at(1_700_000_000, 474), Duration::from_micros(1_500));
+    String::from_utf8(entry.line(StatusCode::OK, 1234, now, elapsed)).unwrap()
 }
 
 #[test]
@@ -78,26 +75,13 @@ fn escapes_like_nginx() {
     assert_eq!(escape("a\"b\\c\x01é"), "a\\\"b\\\\c\\x01\\xC3\\xA9");
 }
 
-#[tokio::test]
-async fn bodies_write_one_entry_when_dropped() {
-    let lines = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&lines);
-    let log = Arc::new(AccessLog::new(AccessFormat::Json, move |line| {
-        sink.lock().unwrap().push(serde_json::from_slice::<Value>(line).unwrap());
-    }));
-    let started = || Started::new(&Request::get("/").body(()).unwrap(), [127, 0, 0, 1].into());
-
-    let mut res = Response::builder().status(404).body(Body::bytes("not found")).unwrap();
+#[test]
+fn entries_name_the_upstream_that_answered() {
+    let log = Arc::new(AccessLog::new(AccessFormat::Json, |_| {}));
+    let req = Request::get("/").body(()).unwrap();
+    let started = || Started::new(&req, [127, 0, 0, 1].into());
+    let mut res = Response::new(());
+    assert_eq!(Entry::new(Arc::clone(&log), started(), &res).upstream, None);
     res.extensions_mut().insert(Answered("127.0.0.1:3000".into()));
-    let res = Logged::wrap(Arc::clone(&log), started(), res);
-    assert_eq!(res.into_body().collect().await.unwrap().to_bytes(), "not found");
-    let unread = Logged::wrap(log, started(), Response::new(Body::bytes("never sent")));
-    drop(unread);
-
-    let lines = lines.lock().unwrap();
-    assert_eq!(lines.len(), 2);
-    assert_eq!((&lines[0]["status"], &lines[0]["bytes"]), (&json!(404), &json!(9)));
-    assert_eq!(lines[0]["upstream"], "127.0.0.1:3000");
-    assert_eq!((&lines[1]["status"], &lines[1]["bytes"]), (&json!(200), &json!(0)));
-    assert_eq!(lines[1]["upstream"], Value::Null);
+    assert_eq!(Entry::new(log, started(), &res).upstream.as_deref(), Some("127.0.0.1:3000"));
 }

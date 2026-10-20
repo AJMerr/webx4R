@@ -16,6 +16,7 @@ httpdate.workspace = true
 hyper ={ workspace = true, features = ["client", "http1", "http2", "server"] }
 hyper-util = { workspace = true, features = ["client-legacy", "http1", "http2", "server-auto", "server-graceful", "tokio"] }
 instant-acme.workspace = true
+prometheus-client.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 serde.workspace = true

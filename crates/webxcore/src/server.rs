@@ -9,7 +9,7 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use http::header::{HOST, LOCATION};
@@ -27,9 +27,11 @@ use webxlib::body::Body;
 use webxlib::pages;
 use webxlib::static_files::StaticFiles;
 
-use crate::access_log::{AccessLog, Logged, Started};
+use crate::access_log::{AccessLog, Entry, Started};
 use crate::acme::{self, ACME_TLS_ALPN, Challenges};
 use crate::config::{self, Config};
+use crate::metrics::{self, Metrics, SiteMetrics};
+use crate::observe::Observed;
 use crate::proxy::{self, Peer, Route};
 use crate::tls::CertStore;
 
@@ -72,6 +74,8 @@ pub struct Reloader {
     manager: Option<acme::Handle>,
     /// The bound HTTPS port, for redirects.
     https_port: Option<u16>,
+    /// Present with `[metrics]`; outlives reloads, so counts carry on.
+    registry: Option<Arc<Metrics>>,
 }
 
 impl Reloader {
@@ -94,7 +98,8 @@ impl Reloader {
         if config.metrics != self.metrics {
             return restart("[metrics]");
         }
-        let router = Router::new(config, self.client.clone(), self.https_port)?;
+        let client = self.client.clone();
+        let router = Router::new(config, client, self.https_port, self.registry.as_deref())?;
         let certs = match &self.certs {
             Some(store) => Some((store, store.load(config)?)),
             None => None,
@@ -148,7 +153,8 @@ impl Server {
         // After binding, so redirects name the port actually bound.
         let https_port = https.as_ref().map(|listener| listener.addr.port());
         let client = proxy::Client::default();
-        let router = Router::new(config, client.clone(), https_port)?;
+        let registry = config.metrics.as_ref().map(|_| Arc::new(Metrics::default()));
+        let router = Router::new(config, client.clone(), https_port, registry.as_deref())?;
         let router = Arc::new(ArcSwap::from_pointee(router));
         let manager = match (&challenges, &certs) {
             (Some(challenges), Some(certs)) => {
@@ -167,6 +173,7 @@ impl Server {
             metrics: config.metrics.clone(),
             manager: handle,
             https_port,
+            registry,
         };
         Ok(Self { http, https, reloader, challenges, manager, access_log: None })
     }
@@ -174,6 +181,11 @@ impl Server {
     /// Records every response in `log` from now on.
     pub fn set_access_log(&mut self, log: AccessLog) {
         self.access_log = Some(Arc::new(log));
+    }
+
+    /// Present with `[metrics]`.
+    pub fn metrics(&self) -> Option<Arc<Metrics>> {
+        self.reloader.registry.clone()
     }
 
     /// A handle for reloading the config while [`Server::run`] serves.
@@ -290,20 +302,19 @@ impl Connection {
     {
         let Self { peer, router, challenges, access_log, builder, watcher } = self;
         let service = service_fn(move |req| {
+            let arrived = Instant::now();
             let logging = access_log
                 .as_ref()
                 .map(|log| (Arc::clone(log), Started::new(&req, peer.addr.ip())));
             let answer = challenges.as_ref().and_then(|challenges| challenges.http_response(&req));
             let router = router.load_full();
             async move {
-                let res = match answer {
-                    Some(res) => res,
+                let (res, metrics) = match answer {
+                    Some(res) => (res, router.unrouted.clone()),
                     None => router.handle(req, peer).await,
                 };
-                Ok::<_, Infallible>(match logging {
-                    Some((log, started)) => Logged::wrap(log, started, res),
-                    None => res.map(Logged::unlogged),
-                })
+                let entry = logging.map(|(log, started)| Entry::new(log, started, &res));
+                Ok::<_, Infallible>(Observed::wrap(res, arrived, entry, metrics))
             }
         });
         let conn = builder.serve_connection_with_upgrades(TokioIo::new(io), service);
@@ -321,6 +332,8 @@ struct Router {
     client: proxy::Client,
     /// The HTTPS port that plain HTTP requests are redirected to, when there is one.
     https_port: Option<u16>,
+    /// Metrics for responses that reach no site; present with `[metrics]`.
+    unrouted: Option<Arc<SiteMetrics>>,
 }
 
 /// Serves one site's requests.
@@ -330,10 +343,17 @@ struct SiteHandler {
     routes: Vec<Route>,
     /// Hosts whose plain HTTP requests are redirected to HTTPS.
     redirect_hosts: HashSet<String>,
+    /// Present with `[metrics]`, labeled with the site's first host, or `default`.
+    metrics: Option<Arc<SiteMetrics>>,
 }
 
 impl Router {
-    fn new(config: &Config, client: proxy::Client, https_port: Option<u16>) -> io::Result<Self> {
+    fn new(
+        config: &Config,
+        client: proxy::Client,
+        https_port: Option<u16>,
+        registry: Option<&Metrics>,
+    ) -> io::Result<Self> {
         let mut sites = HashMap::new();
         let mut default = None;
         let acme = config.acme.is_some();
@@ -351,7 +371,9 @@ impl Router {
                 Some(_) if site.redirect_https => site.tls_hosts(acme).cloned().collect(),
                 _ => HashSet::new(),
             };
-            let handler = Arc::new(SiteHandler { files, routes, redirect_hosts });
+            let name = site.hosts.first().map_or("default", String::as_str);
+            let metrics = registry.map(|registry| registry.site(name));
+            let handler = Arc::new(SiteHandler { files, routes, redirect_hosts, metrics });
             for host in &site.hosts {
                 sites.insert(host.clone(), Arc::clone(&handler));
             }
@@ -359,27 +381,35 @@ impl Router {
                 default = Some(handler);
             }
         }
-        Ok(Self { sites, default, client, https_port })
+        let unrouted = registry.map(|registry| registry.site(metrics::NO_SITE));
+        Ok(Self { sites, default, client, https_port, unrouted })
     }
 
-    async fn handle(&self, req: Request<Incoming>, peer: Peer) -> Response<Body> {
+    /// The response, and the metrics of the site that answered.
+    async fn handle(
+        &self,
+        req: Request<Incoming>,
+        peer: Peer,
+    ) -> (Response<Body>, Option<Arc<SiteMetrics>>) {
         let host = match request_host(&req) {
             Ok(host) => host,
-            Err(code) => return pages::error_response(code),
+            Err(code) => return (pages::error_response(code), self.unrouted.clone()),
         };
         let site = host.as_ref().and_then(|host| self.sites.get(host)).or(self.default.as_ref());
         let Some(site) = site else {
-            return pages::error_response(StatusCode::MISDIRECTED_REQUEST);
+            let res = pages::error_response(StatusCode::MISDIRECTED_REQUEST);
+            return (res, self.unrouted.clone());
         };
+        let metrics = site.metrics.clone();
         // Unknown hosts reach the default site but aren't in its `redirect_hosts`, since no
         // cert covers them.
         if let (false, Some(port), Some(host)) = (peer.https, self.https_port, &host)
             && site.redirect_hosts.contains(host)
             && !req.uri().path().starts_with(acme::HTTP_CHALLENGE_PATH)
         {
-            return redirect_to_https(host, port, req.uri());
+            return (redirect_to_https(host, port, req.uri()), metrics);
         }
-        site.handle(req, peer, &self.client).await
+        (site.handle(req, peer, &self.client).await, metrics)
     }
 }
 

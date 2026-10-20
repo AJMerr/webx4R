@@ -1,24 +1,19 @@
-//! The access log: one line per response, written once its body is sent, so the entry has
-//! the bytes actually sent and the full duration, like nginx's.
+//! The access log: one line per response, in JSON or nginx's combined format. Each entry
+//! is written once its body is sent (see [`crate::observe`]), so it has the bytes actually
+//! sent and the full duration, like nginx's.
 
 #[cfg(test)]
 mod tests;
 
 use std::borrow::Cow;
 use std::fmt::Write as _;
-use std::io;
 use std::net::IpAddr;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, ready};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bytes::Bytes;
 use http::header::{HOST, REFERER, USER_AGENT};
 use http::{HeaderValue, Method, Request, Response, StatusCode, Version};
-use hyper::body::{Body as HttpBody, Frame, SizeHint};
 use serde::Serialize;
-use webxlib::body::Body;
 
 use crate::config::AccessFormat;
 use crate::proxy::Answered;
@@ -41,7 +36,6 @@ impl AccessLog {
 
 /// What's known about a request when it arrives.
 pub(crate) struct Started {
-    at: Instant,
     client: IpAddr,
     method: Method,
     /// Path and query, as requested.
@@ -62,7 +56,6 @@ impl Started {
             None => headers.get(HOST).map(|host| String::from_utf8_lossy(host.as_bytes()).into()),
         };
         Self {
-            at: Instant::now(),
             client: client.to_canonical(),
             method: req.method().clone(),
             uri: uri.path_and_query().map_or_else(|| uri.to_string(), |pq| pq.as_str().to_owned()),
@@ -74,78 +67,23 @@ impl Started {
     }
 }
 
-/// A response body that writes its access log entry when dropped: after the last byte, or
-/// when the client goes away first.
-pub struct Logged {
-    body: Body,
-    entry: Option<Entry>,
-}
-
-impl Logged {
-    /// A body with no entry to write, for servers without an access log.
-    pub(crate) fn unlogged(body: Body) -> Self {
-        Self { body, entry: None }
-    }
-
-    /// Wraps `res`'s body so `log` gets its entry.
-    pub(crate) fn wrap(
-        log: Arc<AccessLog>,
-        started: Started,
-        res: Response<Body>,
-    ) -> Response<Self> {
-        let upstream = res.extensions().get::<Answered>().map(|answered| Arc::clone(&answered.0));
-        let status = res.status();
-        res.map(|body| {
-            let entry = Entry { log, started, status, upstream, bytes: 0 };
-            Self { body, entry: Some(entry) }
-        })
-    }
-}
-
-impl HttpBody for Logged {
-    type Data = Bytes;
-    type Error = io::Error;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
-        let this = &mut *self;
-        let frame = ready!(Pin::new(&mut this.body).poll_frame(cx));
-        if let (Some(Ok(frame)), Some(entry)) = (&frame, &mut this.entry)
-            && let Some(data) = frame.data_ref()
-        {
-            entry.bytes += data.len() as u64;
-        }
-        Poll::Ready(frame)
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.body.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.body.size_hint()
-    }
-}
-
-impl Drop for Logged {
-    fn drop(&mut self) {
-        if let Some(entry) = self.entry.take() {
-            let line = entry.line(SystemTime::now(), entry.started.at.elapsed());
-            (entry.log.write)(&line);
-        }
-    }
-}
-
-struct Entry {
+/// A response's entry, waiting for its body to be sent.
+pub(crate) struct Entry {
     log: Arc<AccessLog>,
     started: Started,
-    status: StatusCode,
     /// The proxy upstream that answered, if any.
     upstream: Option<Arc<str>>,
-    /// Body bytes sent so far.
-    bytes: u64,
+}
+
+impl Entry {
+    pub(crate) fn new<B>(log: Arc<AccessLog>, started: Started, res: &Response<B>) -> Self {
+        let upstream = res.extensions().get::<Answered>().map(|answered| Arc::clone(&answered.0));
+        Self { log, started, upstream }
+    }
+
+    pub(crate) fn write(&self, status: StatusCode, bytes: u64, elapsed: Duration) {
+        (self.log.write)(&self.line(status, bytes, SystemTime::now(), elapsed));
+    }
 }
 
 #[derive(Serialize)]
@@ -166,7 +104,7 @@ struct JsonEntry<'a> {
 }
 
 impl Entry {
-    fn line(&self, now: SystemTime, elapsed: Duration) -> Vec<u8> {
+    fn line(&self, status: StatusCode, bytes: u64, now: SystemTime, elapsed: Duration) -> Vec<u8> {
         let started = &self.started;
         let (referer, user_agent) = (text(&started.referer), text(&started.user_agent));
         let time = Utc::from(now);
@@ -179,8 +117,8 @@ impl Entry {
                     method: started.method.as_str(),
                     uri: &started.uri,
                     protocol: protocol(started.version),
-                    status: self.status.as_u16(),
-                    bytes: self.bytes,
+                    status: status.as_u16(),
+                    bytes,
                     duration: elapsed.as_secs_f64(),
                     referer,
                     user_agent,
@@ -198,8 +136,8 @@ impl Entry {
                     started.client,
                     time.clf(),
                     escape(&request),
-                    self.status.as_u16(),
-                    self.bytes,
+                    status.as_u16(),
+                    bytes,
                     escape(referer.as_deref().unwrap_or("-")),
                     escape(user_agent.as_deref().unwrap_or("-")),
                 );

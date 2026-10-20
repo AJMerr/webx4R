@@ -29,6 +29,7 @@ struct Running {
     done: tokio::task::JoinHandle<()>,
     reloader: Reloader,
     challenges: Option<Arc<Challenges>>,
+    metrics: Option<Arc<Metrics>>,
     /// Every access log entry so far, in JSON.
     access: Arc<Mutex<Vec<serde_json::Value>>>,
     /// The config text the server started with.
@@ -85,13 +86,28 @@ impl Running {
         }));
         let (http, https) = (server.http_addr(), server.https_addr());
         let reloader = server.reloader();
-        let challenges = server.challenges.clone();
+        let (challenges, metrics) = (server.challenges.clone(), server.metrics());
         let (stop, stopped) = oneshot::channel();
         let done = tokio::spawn(server.run(async {
             let _ = stopped.await;
         }));
         let config = text.to_owned();
-        Self { http, https, stop: Some(stop), done, reloader, challenges, access, config, dir }
+        let stop = Some(stop);
+        Self { http, https, stop, done, reloader, challenges, metrics, access, config, dir }
+    }
+
+    /// Waits briefly for the metrics to contain every line in `lines`: like an access log
+    /// entry, a response is counted when its body is dropped.
+    async fn wait_for_metrics(&self, lines: &[&str]) {
+        let metrics = self.metrics.as_ref().expect("the config has [metrics]");
+        for _ in 0..100 {
+            let text = metrics.encode();
+            if lines.iter().all(|line| text.contains(&format!("{line}\n"))) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("expected {lines:#?} in:\n{}", metrics.encode());
     }
 
     /// The first `n` access log entries, waiting briefly: an entry is written when its body
@@ -307,6 +323,40 @@ async fn access_log_records_files_proxied_and_redirected_responses() {
     assert_eq!(proxied["bytes"], echoed.len());
     let redirected = find("/old?x=1");
     assert_eq!((&redirected["status"], &redirected["bytes"]), (&json!(308), &json!(0)));
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn metrics_count_responses_per_site_across_reloads() {
+    let text = "[server]\nhttp = \"127.0.0.1:0\"\n[[site]]\nhosts = [\"a.test\"]\nroot = \"a\"\n\
+                [[site]]\nroot = \"fallback\"\ndefault = true\n\
+                [metrics]\nlisten = \"127.0.0.1:0\"\n";
+    let server = Running::start_with(tempfile::tempdir().unwrap(), text).await;
+    server.get("a.test").await;
+    server.get_path("a.test", "/missing").await;
+    server.get("unknown.test").await;
+    server.raw("GET / HTTP/1.1\r\nConnection: close\r\n\r\n").await;
+    server
+        .wait_for_metrics(&[
+            "webx4r_http_responses_total{site=\"a.test\",code=\"2xx\"} 1",
+            "webx4r_http_responses_total{site=\"a.test\",code=\"4xx\"} 1",
+            "webx4r_http_responses_total{site=\"default\",code=\"2xx\"} 1",
+            "webx4r_http_responses_total{site=\"none\",code=\"4xx\"} 1",
+            "webx4r_http_response_body_bytes_total{site=\"default\"} 8",
+        ])
+        .await;
+
+    server.reload(text).unwrap();
+    server.get("a.test").await;
+    let line = "webx4r_http_responses_total{site=\"a.test\",code=\"2xx\"} 2";
+    server.wait_for_metrics(&[line]).await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn no_metrics_without_the_table() {
+    let server = Running::start(false).await;
+    assert!(server.metrics.is_none());
     server.stop().await;
 }
 
