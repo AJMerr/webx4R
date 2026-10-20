@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use http::header::HOST;
 use http::uri::Authority;
-use http::{Request, Response, StatusCode, Version};
+use http::{Method, Request, Response, StatusCode, Version};
+use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
@@ -26,6 +27,7 @@ use webxlib::pages;
 use webxlib::static_files::StaticFiles;
 
 use crate::config::Config;
+use crate::proxy::{self, Peer, Route};
 use crate::tls;
 
 /// How long shutdown waits for in-flight requests before dropping them.
@@ -134,7 +136,7 @@ impl Server {
             }
 
             let conn = Connection {
-                peer,
+                peer: Peer { addr: peer, https: listener.tls.is_some() },
                 router: Arc::clone(&self.router),
                 builder: Arc::clone(builder),
                 watcher: graceful.watcher(),
@@ -157,7 +159,7 @@ impl Server {
 
 /// An accepted connection, served once any TLS handshake is done.
 struct Connection {
-    peer: SocketAddr,
+    peer: Peer,
     router: Arc<Router>,
     builder: Arc<ConnBuilder>,
     /// Held from accept, so shutdown also waits for handshakes in progress.
@@ -172,19 +174,28 @@ impl Connection {
         let Self { peer, router, builder, watcher } = self;
         let service = service_fn(move |req| {
             let router = Arc::clone(&router);
-            async move { Ok::<_, Infallible>(router.handle(req).await) }
+            async move { Ok::<_, Infallible>(router.handle(req, peer).await) }
         });
         let conn = builder.serve_connection_with_upgrades(TokioIo::new(io), service);
         if let Err(e) = watcher.watch(conn.into_owned()).await {
-            tracing::debug!(%peer, error = %e, "connection ended with an error");
+            tracing::debug!(peer = %peer.addr, error = %e, "connection ended with an error");
         }
     }
 }
 
 /// Picks the site for each request.
 struct Router {
-    sites: HashMap<String, StaticFiles>,
-    default: Option<StaticFiles>,
+    sites: HashMap<String, Arc<SiteHandler>>,
+    default: Option<Arc<SiteHandler>>,
+    /// Shared by every site, so they all draw on one pool of upstream connections.
+    client: proxy::Client,
+}
+
+/// Serves one site's requests.
+struct SiteHandler {
+    files: Option<StaticFiles>,
+    /// Longest prefix first, so the most specific route wins.
+    routes: Vec<Route>,
 }
 
 impl Router {
@@ -192,29 +203,60 @@ impl Router {
         let mut sites = HashMap::new();
         let mut default = None;
         for (i, site) in config.sites.iter().enumerate() {
-            let files = StaticFiles::new(&site.root, site.policy()).map_err(|e| {
-                let root = site.root.display();
-                io::Error::new(e.kind(), format!("site {}: can't open root {root}: {e}", i + 1))
-            })?;
+            let files = match &site.root {
+                Some(root) => Some(StaticFiles::new(root, site.policy()).map_err(|e| {
+                    let root = root.display();
+                    io::Error::new(e.kind(), format!("site {}: can't open root {root}: {e}", i + 1))
+                })?),
+                None => None,
+            };
+            let mut routes: Vec<_> = site.proxies.iter().map(Route::new).collect();
+            routes.sort_by_key(|route| std::cmp::Reverse(route.prefix().len()));
+            let handler = Arc::new(SiteHandler { files, routes });
             for host in &site.hosts {
-                sites.insert(host.clone(), files.clone());
+                sites.insert(host.clone(), Arc::clone(&handler));
             }
             if site.default {
-                default = Some(files);
+                default = Some(handler);
             }
         }
-        Ok(Self { sites, default })
+        Ok(Self { sites, default, client: proxy::Client::default() })
     }
 
-    async fn handle<B>(&self, req: Request<B>) -> Response<Body> {
+    async fn handle(&self, req: Request<Incoming>, peer: Peer) -> Response<Body> {
         let host = match request_host(&req) {
             Ok(host) => host,
             Err(code) => return pages::error_response(code),
         };
         let site = host.and_then(|host| self.sites.get(&host)).or(self.default.as_ref());
         match site {
-            Some(site) => site.serve(&req).await,
+            Some(site) => site.handle(req, peer, &self.client).await,
             None => pages::error_response(StatusCode::MISDIRECTED_REQUEST),
+        }
+    }
+}
+
+impl SiteHandler {
+    /// Proxies the request if a route matches its path, else serves static files.
+    async fn handle(
+        &self,
+        req: Request<Incoming>,
+        peer: Peer,
+        client: &proxy::Client,
+    ) -> Response<Body> {
+        let Some(route) = self.routes.iter().find(|route| route.matches(req.uri().path())) else {
+            return match &self.files {
+                Some(files) => files.serve(&req).await,
+                None => pages::error_response(StatusCode::NOT_FOUND),
+            };
+        };
+        let head = req.method() == Method::HEAD;
+        match route.forward(client, req, peer).await {
+            Ok(res) => res,
+            Err(e) => match &self.files {
+                Some(files) => files.error_response(e.status(), head).await,
+                None => pages::error_response(e.status()),
+            },
         }
     }
 }

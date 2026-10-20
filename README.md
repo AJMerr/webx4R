@@ -1,6 +1,6 @@
 # webx4R
 
-A web server and app platform written in Rust. Today it serves static sites. The plan is to add a reverse proxy for apps written in any language, then run those apps itself, then spread them across several machines.
+A web server and app platform written in Rust. Today it serves static sites and proxies requests to apps written in any language. The plan is to run those apps itself next, then spread them across several machines.
 
 ## Status
 
@@ -9,13 +9,14 @@ Early development; there are no releases yet. What works now:
 - Static files over HTTP/1.1 and HTTP/2
 - HTTPS with a certificate per site, picked by hostname (SNI); `localhost` sites get a self-signed certificate automatically
 - Several sites on one listener, picked by hostname
+- Reverse proxy to apps by path prefix, with several upstreams per route, passive health checks, retries and WebSocket pass-through
 - ETag and Last-Modified, with 304 Not Modified responses
 - Range requests, including multiple ranges in one request
 - Optional directory listings
 - Built-in error pages that a site can replace with its own
 - Graceful shutdown on Ctrl-C, or SIGTERM on Unix
 
-The reverse proxy, config reload, automatic certificates (ACME) and metrics are not built yet. They make up the rest of the first milestone.
+Config reload, automatic certificates (ACME) and metrics are not built yet. They make up the rest of the first milestone.
 
 Linux is the main target. Windows is supported and tested in CI.
 
@@ -76,7 +77,7 @@ Add one block per site.
 | Key | Default | Meaning |
 |---|---|---|
 | `hosts` | `[]` | Hostnames the site answers to: lowercase ASCII, no port. |
-| `root` | required | Folder to serve. A relative path is resolved from the config file's folder. |
+| `root` | none | Folder of static files to serve. A relative path is resolved from the config file's folder. A site needs a `root`, at least one `[[site.proxy]]`, or both. |
 | `default` | `false` | Serve requests whose hostname matches no other site. Only one site can be the default, and a site with no `hosts` must be. |
 | `directory_listing` | `false` | List the contents of folders that have no `index.html`. |
 | `allow_dotfiles` | `false` | Serve names that start with `.`. `/.well-known/` is always served. |
@@ -86,7 +87,31 @@ Add one block per site.
 
 A request for an unknown hostname gets `421 Misdirected Request` when no site is the default. Unknown keys are rejected at startup, so typos don't go unnoticed.
 
-To replace a built-in error page, put a file named after the status code (`404.html`, `500.html`) in the site's root.
+To replace a built-in error page, put a file named after the status code (`404.html`, `502.html`) in the site's root.
+
+### `[[site.proxy]]`
+
+Add one block under a site for each path that should go to an app.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `path` | required | Path prefix to forward, such as `/api`. It matches whole segments: `/api` matches `/api` and `/api/users`, not `/apix`. `/` forwards everything. |
+| `upstreams` | required | Apps to forward to, as `host:port`, such as `["127.0.0.1:3000", "127.0.0.1:3001"]`. Plain HTTP/1.1 only. |
+| `strip_prefix` | `false` | Remove `path` before forwarding, so `/api/users` reaches the app as `/users`. |
+
+```toml
+[[site]]
+hosts = ["example.com"]
+root = "www"
+
+[[site.proxy]]
+path = "/api"
+upstreams = ["127.0.0.1:3000", "127.0.0.1:3001"]
+```
+
+When several prefixes match, the longest wins. Paths that match none are served from `root`, or get a 404 if the site has none.
+
+The app sees the client's `Host` header, plus `X-Forwarded-For`, `X-Forwarded-Host` and `X-Forwarded-Proto`. Requests take turns across `upstreams`. An upstream that refuses a connection or doesn't respond is skipped for 10 seconds. If a connection fails, the request is retried on the next upstream, since it was never sent. An upstream gets 5 seconds to accept a connection (otherwise `502 Bad Gateway`) and 60 seconds to start its response (otherwise `504 Gateway Timeout`). WebSockets and other `Upgrade` requests pass through.
 
 ### HTTPS
 
@@ -107,7 +132,7 @@ CI runs all three on Linux and Windows.
 | Crate | Contents |
 |---|---|
 | `crates/webxlib` | HTTP building blocks: static files, MIME types, pages, response bodies |
-| `crates/webxcore` | The server: config, listeners, TLS, routing |
+| `crates/webxcore` | The server: config, listeners, TLS, routing, reverse proxy |
 | `crates/webx4r` | The `webx4r` command |
 
 ## History

@@ -1,6 +1,6 @@
 //! The `webx4r.toml` config file: parsing and validation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
@@ -33,8 +33,11 @@ pub struct Site {
     /// Lowercase hostnames, without ports.
     #[serde(default)]
     pub hosts: Vec<String>,
-    /// Absolute after loading; relative paths resolve against the config file's folder.
-    pub root: PathBuf,
+    /// Static files. Absolute after loading; relative paths resolve against the config file's folder.
+    pub root: Option<PathBuf>,
+    /// Paths forwarded to upstream apps.
+    #[serde(rename = "proxy", default)]
+    pub proxies: Vec<Proxy>,
     /// Serves requests whose `Host` matches no other site.
     #[serde(default)]
     pub default: bool,
@@ -48,6 +51,18 @@ pub struct Site {
     pub cert: Option<PathBuf>,
     /// PEM private key for `cert`.
     pub key: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Proxy {
+    /// Path prefix matched by whole segments, without a trailing `/` (except `/` itself).
+    pub path: String,
+    /// `host:port` of each upstream app.
+    pub upstreams: Vec<String>,
+    /// Remove `path` from the request path before forwarding.
+    #[serde(default)]
+    pub strip_prefix: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -109,12 +124,15 @@ impl Config {
     pub fn parse(text: &str, base: &Path) -> Result<Self, ConfigError> {
         let mut config: Self = toml::from_str(text).map_err(ConfigError::Parse)?;
         for site in &mut config.sites {
-            site.root = base.join(&site.root);
-            for path in [&mut site.cert, &mut site.key].into_iter().flatten() {
+            for path in [&mut site.root, &mut site.cert, &mut site.key].into_iter().flatten() {
                 *path = base.join(&*path);
             }
             for host in &mut site.hosts {
                 host.make_ascii_lowercase();
+            }
+            for proxy in &mut site.proxies {
+                let trimmed = proxy.path.trim_end_matches('/').len();
+                proxy.path.truncate(trimmed.max(1));
             }
         }
         config.validate()?;
@@ -143,6 +161,10 @@ impl Config {
             if site.hosts.is_empty() && !site.default {
                 return invalid(format!("site {n} needs `hosts`, or `default = true`"));
             }
+            if site.root.is_none() && site.proxies.is_empty() {
+                return invalid(format!("site {n} needs a `root`, a [[site.proxy]] or both"));
+            }
+            validate_proxies(n, &site.proxies)?;
             match (&site.cert, &site.key) {
                 (Some(_), None) => return invalid(format!("site {n} has `cert` but no `key`")),
                 (None, Some(_)) => return invalid(format!("site {n} has `key` but no `cert`")),
@@ -169,6 +191,40 @@ impl Config {
             );
         }
         Ok(())
+    }
+}
+
+fn validate_proxies(n: usize, proxies: &[Proxy]) -> Result<(), ConfigError> {
+    let invalid = |msg: String| Err(ConfigError::Invalid(msg));
+    let mut paths = HashSet::new();
+    for Proxy { path, upstreams, .. } in proxies {
+        if !path.starts_with('/') || path.contains(['?', '#']) {
+            return invalid(format!(
+                "site {n}: proxy path \"{path}\" must start with `/` and have no `?` or `#`"
+            ));
+        }
+        if !paths.insert(path) {
+            return invalid(format!("site {n} has two proxies for \"{path}\""));
+        }
+        if upstreams.is_empty() {
+            return invalid(format!("site {n}: proxy \"{path}\" needs `upstreams`"));
+        }
+        if let Some(bad) = upstreams.iter().find(|upstream| !is_upstream(upstream)) {
+            return invalid(format!(
+                "site {n}: upstream \"{bad}\" must be host:port, such as 127.0.0.1:3000"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `host:port` with an IP address or hostname and a non-zero port; no scheme or path.
+fn is_upstream(addr: &str) -> bool {
+    match addr.parse::<SocketAddr>() {
+        Ok(addr) => addr.port() != 0,
+        Err(_) => addr.rsplit_once(':').is_some_and(|(host, port)| {
+            port.parse::<u16>().is_ok_and(|port| port != 0) && is_hostname(host)
+        }),
     }
 }
 
@@ -218,7 +274,8 @@ mod tests {
         assert_eq!(config.server.http, Some("0.0.0.0:8080".parse().unwrap()));
         assert_eq!(config.server.https, None);
         let site = &config.sites[0];
-        assert_eq!(site.root, Path::new("/etc/webx4r/www"));
+        assert_eq!(site.root.as_deref(), Some(Path::new("/etc/webx4r/www")));
+        assert!(site.proxies.is_empty());
         assert!(!site.default && !site.directory_listing && !site.allow_dotfiles);
         assert_eq!(site.policy().symlinks, Symlinks::InsideRoot);
     }
@@ -242,7 +299,7 @@ mod tests {
         .unwrap();
         let site = &config.sites[0];
         assert_eq!(site.hosts, ["example.com", "www.example.com"]);
-        assert_eq!(site.root, Path::new("/srv/www"));
+        assert_eq!(site.root.as_deref(), Some(Path::new("/srv/www")));
         let policy = site.policy();
         assert!(site.default && policy.directory_listing && policy.allow_dotfiles);
         assert_eq!(policy.symlinks, Symlinks::Deny);
@@ -360,6 +417,56 @@ mod tests {
     fn localhost_names() {
         assert!(is_localhost("localhost") && is_localhost("a.b.localhost"));
         assert!(!is_localhost("mylocalhost") && !is_localhost("localhost.com"));
+    }
+
+    /// MINIMAL with `root` replaced by `site`, e.g. proxy blocks.
+    fn with_site(site: &str) -> String {
+        MINIMAL.replace("root = \"www\"", site)
+    }
+
+    fn proxy(path: &str, upstreams: &str) -> String {
+        format!("[[site.proxy]]\npath = \"{path}\"\nupstreams = [{upstreams}]\n")
+    }
+
+    #[test]
+    fn proxy_settings() {
+        let site = proxy("/api/", "\"127.0.0.1:8081\", \"localhost:8082\"")
+            + &proxy("/", "\"[::1]:3000\"")
+            + "strip_prefix = true";
+        let config = parse(&with_site(&site)).unwrap();
+        let site = &config.sites[0];
+        assert_eq!(site.root, None);
+        let [api, all] = &site.proxies[..] else { panic!("{:?}", site.proxies) };
+        assert_eq!(api.path, "/api", "trailing slashes are trimmed");
+        assert_eq!(api.upstreams, ["127.0.0.1:8081", "localhost:8082"]);
+        assert!(!api.strip_prefix);
+        assert_eq!((all.path.as_str(), all.strip_prefix), ("/", true));
+    }
+
+    #[test]
+    fn site_needs_root_or_proxy() {
+        let msg = invalid(&with_site(""));
+        assert_eq!(msg, "site 1 needs a `root`, a [[site.proxy]] or both");
+    }
+
+    #[test]
+    fn proxy_paths_are_validated() {
+        for path in ["api", "", "/api?x", "/a#b"] {
+            let msg = invalid(&with_site(&proxy(path, "\"127.0.0.1:1\"")));
+            assert!(msg.contains("must start with `/`"), "{path}: {msg}");
+        }
+        let twice = proxy("/api", "\"127.0.0.1:1\"") + &proxy("/api/", "\"127.0.0.1:2\"");
+        assert_eq!(invalid(&with_site(&twice)), "site 1 has two proxies for \"/api\"");
+    }
+
+    #[test]
+    fn upstreams_are_validated() {
+        let msg = invalid(&with_site(&proxy("/", "")));
+        assert_eq!(msg, "site 1: proxy \"/\" needs `upstreams`");
+        for bad in ["127.0.0.1", "localhost", "http://127.0.0.1:3000", "a:0", "a:99999", "a/b:80"] {
+            let msg = invalid(&with_site(&proxy("/", &format!("\"{bad}\""))));
+            assert!(msg.contains("must be host:port"), "{bad}: {msg}");
+        }
     }
 
     #[test]

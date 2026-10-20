@@ -14,6 +14,7 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
 use super::*;
+use crate::proxy::tests::{echo_upstream, upgrade_upstream};
 use crate::tls::tests::write_pair;
 
 /// A running server on random ports with sites `a.test`, `b.test` and optionally a default.
@@ -97,7 +98,11 @@ impl Running {
     }
 
     async fn get(&self, host: &str) -> String {
-        self.raw(&format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")).await
+        self.get_path(host, "/").await
+    }
+
+    async fn get_path(&self, host: &str, path: &str) -> String {
+        self.raw(&format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")).await
     }
 
     async fn stop(mut self) {
@@ -188,6 +193,119 @@ async fn serves_http2_by_authority() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(res.into_body().collect().await.unwrap().to_bytes(), "site b");
     drop(sender);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn site_without_root_has_no_static_files() {
+    let text = "[server]\nhttp = \"127.0.0.1:0\"\n[[site]]\nhosts = [\"c.test\"]\n\
+                [[site.proxy]]\npath = \"/api\"\nupstreams = [\"127.0.0.1:9\"]\n";
+    let server = Running::start_with(tempfile::tempdir().unwrap(), text).await;
+    let response = server.get("c.test").await;
+    assert!(response.starts_with("HTTP/1.1 404 Not Found"), "{response}");
+    server.stop().await;
+}
+
+/// An address with nothing listening on it.
+async fn closed_port() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    listener.local_addr().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn routes_paths_to_proxies_and_static_files() {
+    let upstream = echo_upstream().await;
+    let text = format!(
+        "[server]\nhttp = \"127.0.0.1:0\"\n[[site]]\nhosts = [\"a.test\"]\nroot = \"a\"\n\
+         [[site.proxy]]\npath = \"/api\"\nupstreams = [\"{upstream}\"]\n\
+         [[site.proxy]]\npath = \"/api/v2/\"\nupstreams = [\"{upstream}\"]\nstrip_prefix = true\n"
+    );
+    let server = Running::start_with(tempfile::tempdir().unwrap(), &text).await;
+    let body = |res: String| res.split_once("\r\n\r\n").unwrap().1.to_owned();
+
+    assert_eq!(body(server.get("a.test").await), "site a");
+    let api = body(server.get_path("a.test", "/api/users?page=2").await);
+    assert!(api.starts_with("GET /api/users?page=2\n"), "{api}");
+    assert!(api.contains("\nx-forwarded-for: 127.0.0.1\n"), "{api}");
+    assert!(api.contains("\nx-forwarded-proto: http\n"), "{api}");
+    let v2 = body(server.get_path("a.test", "/api/v2/users").await);
+    assert!(v2.starts_with("GET /users\n"), "longest prefix wins, and is stripped: {v2}");
+    assert!(body(server.get_path("a.test", "/api/v2").await).starts_with("GET /\n"));
+    let other = server.get_path("a.test", "/apix").await;
+    assert!(other.starts_with("HTTP/1.1 404"), "not a proxy path: {other}");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn proxies_https_requests_to_http_upstreams() {
+    let upstream = echo_upstream().await;
+    let dir = tempfile::tempdir().unwrap();
+    write_pair(dir.path(), "a.test");
+    let text = format!(
+        "[server]\nhttps = \"127.0.0.1:0\"\n[[site]]\nhosts = [\"a.test\"]\n\
+         cert = \"a.test.crt\"\nkey = \"a.test.key\"\n\
+         [[site.proxy]]\npath = \"/\"\nupstreams = [\"{upstream}\"]\n"
+    );
+    let server = Running::start_with(dir, &text).await;
+    let (version, body) = get_tls(server.tls("a.test", b"h2").await, "a.test").await;
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert_eq!(version, Version::HTTP_2);
+    assert!(body.contains("\nhost: a.test\n"), "{body}");
+    assert!(body.contains("\nx-forwarded-proto: https\n"), "{body}");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn upgrades_are_relayed_both_ways() {
+    let upstream = upgrade_upstream().await;
+    let text = format!(
+        "[server]\nhttp = \"127.0.0.1:0\"\n[[site]]\nhosts = [\"a.test\"]\n\
+         [[site.proxy]]\npath = \"/ws\"\nupstreams = [\"{upstream}\"]\n"
+    );
+    let server = Running::start_with(tempfile::tempdir().unwrap(), &text).await;
+    let mut stream = TcpStream::connect(server.http.unwrap()).await.unwrap();
+    let request =
+        "GET /ws HTTP/1.1\r\nHost: a.test\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n";
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        head.push(stream.read_u8().await.unwrap());
+    }
+    let head = String::from_utf8(head).unwrap().to_ascii_lowercase();
+    assert!(head.starts_with("http/1.1 101 switching protocols"), "{head}");
+    assert!(head.contains("\r\nconnection: upgrade\r\n"), "{head}");
+    assert!(head.contains("\r\nupgrade: echo\r\n"), "{head}");
+
+    for message in ["ping", "pong"] {
+        stream.write_all(message.as_bytes()).await.unwrap();
+        let mut reply = [0; 4];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, message.as_bytes());
+    }
+    drop(stream);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn unreachable_upstream_gets_a_502_page() {
+    let upstream = closed_port().await;
+    let text = format!(
+        "[server]\nhttp = \"127.0.0.1:0\"\n\
+         [[site]]\nhosts = [\"a.test\"]\nroot = \"a\"\n\
+         [[site.proxy]]\npath = \"/api\"\nupstreams = [\"{upstream}\"]\n\
+         [[site]]\nhosts = [\"c.test\"]\n\
+         [[site.proxy]]\npath = \"/\"\nupstreams = [\"{upstream}\"]\n"
+    );
+    let server = Running::start_with(tempfile::tempdir().unwrap(), &text).await;
+    fs::write(server.dir.path().join("a/502.html"), "custom 502").unwrap();
+
+    let custom = server.get_path("a.test", "/api").await;
+    assert!(custom.starts_with("HTTP/1.1 502 Bad Gateway"), "{custom}");
+    assert!(custom.ends_with("custom 502"), "the site's own page: {custom}");
+    let built_in = server.get("c.test").await;
+    assert!(built_in.starts_with("HTTP/1.1 502 Bad Gateway"), "{built_in}");
+    assert!(built_in.contains("upstream server"), "{built_in}");
     server.stop().await;
 }
 
