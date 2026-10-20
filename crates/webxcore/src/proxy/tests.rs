@@ -14,7 +14,7 @@ const PEER: Peer =
     Peer { addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)), 5555), https: true };
 
 /// Starts an upstream that answers each request with its method, URI, headers and body.
-async fn echo_upstream() -> String {
+pub(crate) async fn echo_upstream() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     tokio::spawn(async move {
@@ -141,6 +141,31 @@ async fn slow_upstream_is_a_gateway_timeout() {
     let err = client.forward(req, &upstream, PEER).await.err().unwrap();
     assert!(matches!(err, ProxyError::Timeout), "{err:?}");
     assert_eq!(err.status(), StatusCode::GATEWAY_TIMEOUT);
+}
+
+fn route(prefix: &str) -> Route {
+    Route::new(&config::Proxy {
+        path: prefix.to_owned(),
+        upstreams: vec!["127.0.0.1:9".to_owned()],
+        strip_prefix: true,
+    })
+}
+
+#[test]
+fn routes_match_whole_segments() {
+    let api = route("/api");
+    assert!(api.matches("/api") && api.matches("/api/") && api.matches("/api/x/y"));
+    assert!(!api.matches("/apix") && !api.matches("/") && !api.matches("/API"));
+    assert!(route("/").matches("/") && route("/").matches("/anything"));
+}
+
+#[test]
+fn strip_prefix_keeps_the_rest() {
+    let strip = |uri: &str, prefix| strip_prefix(&uri.parse().unwrap(), prefix).unwrap();
+    assert_eq!(strip("/api/users?page=2", "/api"), "/users?page=2");
+    assert_eq!(strip("/api", "/api"), "/");
+    assert_eq!(strip("/api?x", "/api"), "/?x");
+    assert_eq!(strip("https://example.com/api/x", "/api"), "https://example.com/x");
 }
 
 #[tokio::test]

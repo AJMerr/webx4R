@@ -132,7 +132,7 @@ impl StaticFiles {
     }
 
     /// Serves the site's own `<code>.html` if it has one, else the built-in page.
-    async fn error_response(&self, code: StatusCode, head: bool) -> Response<Body> {
+    pub async fn error_response(&self, code: StatusCode, head: bool) -> Response<Body> {
         let custom = PathBuf::from(format!("{}.html", code.as_u16()));
         let mut res = match self.locate(custom.clone()).await {
             Ok(Target::File(open)) => file_response(&custom, open, head),

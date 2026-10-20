@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::header::{CONNECTION, HOST, TE, TRANSFER_ENCODING, UPGRADE};
+use http::uri::PathAndQuery;
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Uri, Version};
 use http_body_util::BodyExt;
 use http_body_util::combinators::UnsyncBoxBody;
@@ -13,6 +14,8 @@ use hyper_util::client::legacy;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use webxlib::body::Body;
+
+use crate::config;
 
 /// How long an upstream gets to accept a TCP connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -151,6 +154,68 @@ impl Client {
     }
 }
 
+/// A site's `[[site.proxy]]`: requests at or below `prefix` go to its upstreams.
+pub struct Route {
+    prefix: String,
+    upstreams: Vec<String>,
+    strip_prefix: bool,
+}
+
+impl Route {
+    pub fn new(config: &config::Proxy) -> Self {
+        Self {
+            prefix: config.path.clone(),
+            upstreams: config.upstreams.clone(),
+            strip_prefix: config.strip_prefix,
+        }
+    }
+
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    /// Matches whole segments: `/api` matches `/api` and `/api/x`, not `/apix`.
+    pub fn matches(&self, path: &str) -> bool {
+        path.strip_prefix(self.prefix.as_str())
+            .is_some_and(|rest| self.prefix == "/" || rest.is_empty() || rest.starts_with('/'))
+    }
+
+    /// Forwards `req` to an upstream, without the prefix if `strip_prefix` is set.
+    pub async fn forward<B>(
+        &self,
+        client: &Client,
+        mut req: Request<B>,
+        peer: Peer,
+    ) -> Result<Response<Body>, ProxyError>
+    where
+        B: hyper::body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<BoxError>,
+    {
+        if self.strip_prefix && self.prefix != "/" {
+            *req.uri_mut() = strip_prefix(req.uri(), &self.prefix)?;
+        }
+        let upstream = &self.upstreams[0];
+        let result = client.forward(req, upstream, peer).await;
+        if let Err(e) = &result {
+            tracing::warn!(%upstream, client = %peer.addr, error = %e, "proxy request failed");
+        }
+        result
+    }
+}
+
+/// `/api/x?q` without `/api` is `/x?q`; the prefix alone becomes `/`.
+fn strip_prefix(uri: &Uri, prefix: &str) -> Result<Uri, ProxyError> {
+    let rest = uri.path().strip_prefix(prefix).unwrap_or(uri.path());
+    let rest = if rest.is_empty() { "/" } else { rest };
+    let path = match uri.query() {
+        Some(query) => format!("{rest}?{query}"),
+        None => rest.to_owned(),
+    };
+    let mut parts = uri.clone().into_parts();
+    parts.path_and_query = Some(PathAndQuery::try_from(path).map_err(|_| ProxyError::BadRequest)?);
+    Uri::from_parts(parts).map_err(|_| ProxyError::BadRequest)
+}
+
 /// Removes headers that apply to a single connection (RFC 9110 §7.6.1),
 /// including any that `Connection` names.
 fn remove_hop_by_hop(headers: &mut HeaderMap) {
@@ -185,4 +250,4 @@ fn append_forwarded_for(headers: &mut HeaderMap, ip: IpAddr) {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
