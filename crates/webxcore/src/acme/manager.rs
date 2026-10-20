@@ -15,6 +15,7 @@ use tokio::sync::watch;
 
 use super::{Challenges, Issued, Storage, account};
 use crate::config::{Acme, Config};
+use crate::metrics::Metrics;
 use crate::tls::CertStore;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -49,6 +50,8 @@ pub struct Manager {
     account: Option<Account>,
     issued: HashMap<Vec<String>, Issued>,
     failures: HashMap<Vec<String>, Failure>,
+    /// Present with `[metrics]`.
+    metrics: Option<Arc<Metrics>>,
 }
 
 struct Failure {
@@ -72,6 +75,7 @@ impl Manager {
         config: &Config,
         challenges: Arc<Challenges>,
         certs: Arc<CertStore>,
+        metrics: Option<Arc<Metrics>>,
     ) -> io::Result<Option<(Self, Handle)>> {
         let Some(acme) = config.acme.clone() else { return Ok(None) };
         let root = config.acme_storage();
@@ -89,6 +93,7 @@ impl Manager {
             account: None,
             issued: HashMap::new(),
             failures: HashMap::new(),
+            metrics,
         };
         let wanted = manager.wanted.borrow().clone();
         manager.load_saved(&wanted);
@@ -119,6 +124,11 @@ impl Manager {
     /// Loads saved certs for names that have none yet, forgets names no longer wanted, and
     /// serves the result.
     fn load_saved(&mut self, wanted: &[Vec<String>]) {
+        if let Some(metrics) = &self.metrics {
+            for names in self.issued.keys().filter(|names| !wanted.contains(names)) {
+                metrics.certificate_removed(&names[0]);
+            }
+        }
         self.issued.retain(|names, _| wanted.contains(names));
         self.failures.retain(|names, _| wanted.contains(names));
         for names in wanted {
@@ -141,6 +151,9 @@ impl Manager {
         for (names, issued) in &self.issued {
             for name in names {
                 by_host.insert(name.clone(), Arc::clone(&issued.certified));
+            }
+            if let Some(metrics) = &self.metrics {
+                metrics.certificate_expires(&names[0], issued.expires_at);
             }
         }
         self.certs.store_acme(by_host);
@@ -174,6 +187,9 @@ impl Manager {
                     ?names, challenge = ?kind, error = %e,
                     "couldn't get a certificate; retrying in {delay:?}"
                 );
+                if let Some(metrics) = &self.metrics {
+                    metrics.order_failed(&names[0]);
+                }
                 let retry_at = SystemTime::now() + delay;
                 self.failures.insert(names.to_vec(), Failure { count: failures + 1, retry_at });
             }

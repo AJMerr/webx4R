@@ -130,7 +130,6 @@ fn serves_https_only_with_a_self_signed_localhost_cert() {
 }
 
 /// Reads log lines until one contains `needle`, and returns it.
-#[cfg(unix)]
 fn wait_for_log(stderr: &mut BufReader<ChildStderr>, needle: &str) -> String {
     for line in stderr.lines() {
         let line = line.unwrap();
@@ -190,6 +189,89 @@ fn sigterm_shuts_down_cleanly() {
     assert!(status.success(), "{status}: {rest}");
     assert!(rest.contains("shutting down") && rest.contains("stopped"), "{rest}");
     assert_eq!(sockets(), 0, "control socket removed on exit");
+}
+
+#[cfg(unix)]
+#[test]
+fn writes_server_and_access_logs_to_files() {
+    let (dir, config) = site();
+    let port = pebble::free_port();
+    let text = format!(
+        "[server]\nhttp = \"127.0.0.1:{port}\"\n[[site]]\nroot = \"www\"\ndefault = true\n\
+         [log]\ndir = \"logs\"\naccess_format = \"combined\"\n"
+    );
+    fs::write(&config, text).unwrap();
+    let (mut child, mut stderr) = serve(&config);
+    // With [log], that's all stderr gets, so the port comes from the config.
+    wait_for_log(&mut stderr, "webx4r: logging to");
+    let addr = format!("127.0.0.1:{port}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while TcpStream::connect(&addr).is_err() {
+        assert!(std::time::Instant::now() < deadline, "webx4r isn't listening on {addr}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let response = get(&addr);
+    // A clean shutdown flushes the files.
+    send_signal(&child, "TERM");
+    assert!(child.wait().unwrap().success());
+
+    let logs = dir.path().join("logs");
+    let read = |prefix: &str| {
+        let mut files = fs::read_dir(&logs).unwrap().map(|entry| entry.unwrap().path());
+        let file =
+            files.find(|path| path.file_name().unwrap().to_str().unwrap().starts_with(prefix));
+        fs::read_to_string(file.unwrap_or_else(|| panic!("no {prefix}*.log"))).unwrap()
+    };
+    let access = read("access.");
+    let server = read("server.");
+    assert!(response.ends_with("hello from webx4r"), "{response}");
+    assert!(access.starts_with("127.0.0.1 - - ["), "{access}");
+    assert!(access.contains("] \"GET / HTTP/1.1\" 200 17 \"-\" \"-\"\n"), "{access}");
+    assert!(server.contains(&format!("listening on http://{addr}")), "{server}");
+    assert!(server.lines().all(|line| line.starts_with("{\"timestamp\":")), "JSON lines: {server}");
+}
+
+#[test]
+fn serves_metrics_on_their_own_address() {
+    let (_dir, config) = site();
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(&config, text + "[metrics]\nlisten = \"127.0.0.1:0\"\n").unwrap();
+    let (mut child, mut stderr) = serve(&config);
+    let addr = listening_addr(&mut stderr, "http").0;
+    let marker = "serving metrics at http://";
+    let line = wait_for_log(&mut stderr, marker);
+    let metrics = line.split(marker).nth(1).unwrap().trim().trim_end_matches("/metrics");
+    let page = get(&addr);
+
+    // A response is counted once its body is dropped, which can come just after the client
+    // has it all.
+    let counted = "\nwebx4r_http_responses_total{site=\"default\",code=\"2xx\"} 1\n";
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let scrape = loop {
+        let scrape = get_path(metrics, "/metrics");
+        if scrape.contains(counted) || std::time::Instant::now() > deadline {
+            break scrape;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    assert!(page.ends_with("hello from webx4r"), "{page}");
+    assert!(scrape.starts_with("HTTP/1.1 200 OK"), "{scrape}");
+    assert!(scrape.contains(counted) && scrape.ends_with("# EOF\n"), "{scrape}");
+}
+
+#[test]
+fn unwritable_log_dir_fails_at_startup() {
+    let (_dir, config) = site();
+    let text = fs::read_to_string(&config).unwrap();
+    // Can't be a folder: `index.html` is a file.
+    fs::write(&config, text + "[log]\ndir = \"www/index.html/logs\"\n").unwrap();
+    let output = webx4r(&["serve"], &config).output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr.contains("can't write logs in"), "{stderr}");
 }
 
 /// Runs `webx4r reload --config <config>`.

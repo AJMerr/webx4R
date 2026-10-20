@@ -9,10 +9,10 @@ use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use http::header::{HOST, LOCATION};
+use http::header::{ALLOW, CONTENT_TYPE, HOST, HeaderValue, LOCATION};
 use http::uri::{Authority, PathAndQuery};
 use http::{Method, Request, Response, StatusCode, Uri, Version};
 use hyper::body::Incoming;
@@ -21,14 +21,17 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::{GracefulShutdown, Watcher};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use webxlib::body::Body;
 use webxlib::pages;
 use webxlib::static_files::StaticFiles;
 
+use crate::access_log::{AccessLog, Entry, Started};
 use crate::acme::{self, ACME_TLS_ALPN, Challenges};
 use crate::config::{self, Config};
+use crate::metrics::{self, Metrics, SiteMetrics};
+use crate::observe::Observed;
 use crate::proxy::{self, Peer, Route};
 use crate::tls::CertStore;
 
@@ -46,10 +49,13 @@ type ConnBuilder = auto::Builder<TokioExecutor>;
 pub struct Server {
     http: Option<Listener>,
     https: Option<Listener>,
+    /// Serves `/metrics`; present with `[metrics]`.
+    scrape: Option<Listener>,
     reloader: Reloader,
     /// Present with `[acme]`, like `manager`.
     challenges: Option<Arc<Challenges>>,
     manager: Option<acme::Manager>,
+    access_log: Option<Arc<AccessLog>>,
 }
 
 /// Applies a new config to a running [`Server`].
@@ -61,19 +67,31 @@ pub struct Reloader {
     client: proxy::Client,
     /// Present when serving HTTPS.
     certs: Option<Arc<CertStore>>,
-    /// The `[server]` and `[acme]` tables, which only a restart can change.
+    /// The tables only a restart can change.
     server: config::Server,
     acme: Option<config::Acme>,
+    log: Option<config::Log>,
+    metrics: Option<config::Metrics>,
     /// Tells the ACME manager which names the new config needs certs for.
     manager: Option<acme::Handle>,
     /// The bound HTTPS port, for redirects.
     https_port: Option<u16>,
+    /// Present with `[metrics]`; outlives reloads, so counts carry on.
+    registry: Option<Arc<Metrics>>,
 }
 
 impl Reloader {
     /// Builds the new config's sites and certificates, then swaps them in;
     /// on error, the old config stays.
     pub fn reload(&self, config: &Config) -> io::Result<()> {
+        let result = self.apply(config);
+        if let Some(registry) = &self.registry {
+            registry.reloaded(result.is_ok());
+        }
+        result
+    }
+
+    fn apply(&self, config: &Config) -> io::Result<()> {
         let restart = |table| {
             let msg = format!("{table} settings changed; restart to apply them");
             Err(io::Error::new(io::ErrorKind::InvalidInput, msg))
@@ -84,7 +102,14 @@ impl Reloader {
         if config.acme != self.acme {
             return restart("[acme]");
         }
-        let router = Router::new(config, self.client.clone(), self.https_port)?;
+        if config.log != self.log {
+            return restart("[log]");
+        }
+        if config.metrics != self.metrics {
+            return restart("[metrics]");
+        }
+        let client = self.client.clone();
+        let router = Router::new(config, client, self.https_port, self.registry.as_deref())?;
         let certs = match &self.certs {
             Some(store) => Some((store, store.load(config)?)),
             None => None,
@@ -114,6 +139,24 @@ impl Listener {
             .map_err(|e| io::Error::new(e.kind(), format!("can't listen on {addr}: {e}")))?;
         Ok(Self { addr: tcp.local_addr()?, tcp, tls })
     }
+
+    /// The next connection; failed accepts are logged and retried.
+    async fn next(&self) -> (TcpStream, SocketAddr) {
+        loop {
+            match self.tcp.accept().await {
+                Ok((stream, peer)) => {
+                    if let Err(e) = stream.set_nodelay(true) {
+                        tracing::debug!(%peer, error = %e, "couldn't set TCP_NODELAY");
+                    }
+                    return (stream, peer);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "accept failed");
+                    tokio::time::sleep(ACCEPT_BACKOFF).await;
+                }
+            }
+        }
+    }
 }
 
 impl Server {
@@ -135,14 +178,20 @@ impl Server {
             }
             _ => None,
         };
+        let scrape = match &config.metrics {
+            Some(metrics) => Some(Listener::bind(metrics.listen, None).await?),
+            None => None,
+        };
         // After binding, so redirects name the port actually bound.
         let https_port = https.as_ref().map(|listener| listener.addr.port());
         let client = proxy::Client::default();
-        let router = Router::new(config, client.clone(), https_port)?;
+        let registry = config.metrics.as_ref().map(|_| Arc::new(Metrics::default()));
+        let router = Router::new(config, client.clone(), https_port, registry.as_deref())?;
         let router = Arc::new(ArcSwap::from_pointee(router));
         let manager = match (&challenges, &certs) {
             (Some(challenges), Some(certs)) => {
-                acme::Manager::new(config, Arc::clone(challenges), Arc::clone(certs))?
+                let (challenges, certs) = (Arc::clone(challenges), Arc::clone(certs));
+                acme::Manager::new(config, challenges, certs, registry.clone())?
             }
             _ => None,
         };
@@ -153,10 +202,23 @@ impl Server {
             certs,
             server: config.server.clone(),
             acme: config.acme.clone(),
+            log: config.log.clone(),
+            metrics: config.metrics.clone(),
             manager: handle,
             https_port,
+            registry,
         };
-        Ok(Self { http, https, reloader, challenges, manager })
+        Ok(Self { http, https, scrape, reloader, challenges, manager, access_log: None })
+    }
+
+    /// Records every response in `log` from now on.
+    pub fn set_access_log(&mut self, log: AccessLog) {
+        self.access_log = Some(Arc::new(log));
+    }
+
+    /// Present with `[metrics]`.
+    pub fn metrics(&self) -> Option<Arc<Metrics>> {
+        self.reloader.registry.clone()
     }
 
     /// A handle for reloading the config while [`Server::run`] serves.
@@ -170,6 +232,11 @@ impl Server {
 
     pub fn https_addr(&self) -> Option<SocketAddr> {
         self.https.as_ref().map(|listener| listener.addr)
+    }
+
+    /// Where `/metrics` is served; present with `[metrics]`.
+    pub fn metrics_addr(&self) -> Option<SocketAddr> {
+        self.scrape.as_ref().map(|listener| listener.addr)
     }
 
     /// Serves, and keeps ACME certs issued, until `shutdown` resolves; then lets in-flight
@@ -190,8 +257,9 @@ impl Server {
         };
         let http = self.accept(self.http.as_ref(), &builder, &graceful);
         let https = self.accept(self.https.as_ref(), &builder, &graceful);
+        let scrape = self.serve_metrics(&builder, &graceful);
         tokio::select! {
-            _ = async { tokio::join!(http, https, acme) } => {}
+            _ = async { tokio::join!(http, https, scrape, acme) } => {}
             () = shutdown => {}
         }
 
@@ -212,30 +280,35 @@ impl Server {
         graceful: &GracefulShutdown,
     ) {
         let Some(listener) = listener else { return std::future::pending().await };
+        let name = if listener.tls.is_some() { "https" } else { "http" };
+        let metrics =
+            self.reloader.registry.as_ref().map(|registry| Arc::new(registry.listener(name)));
         loop {
-            let (stream, peer) = match listener.tcp.accept().await {
-                Ok(accepted) => accepted,
-                Err(e) => {
-                    tracing::warn!(error = %e, "accept failed");
-                    tokio::time::sleep(ACCEPT_BACKOFF).await;
-                    continue;
-                }
-            };
-            if let Err(e) = stream.set_nodelay(true) {
-                tracing::debug!(%peer, error = %e, "couldn't set TCP_NODELAY");
-            }
-
+            let (stream, peer) = listener.next().await;
             let conn = Connection {
                 peer: Peer { addr: peer, https: listener.tls.is_some() },
                 router: Arc::clone(&self.reloader.router),
                 challenges: self.challenges.clone(),
+                access_log: self.access_log.clone(),
                 builder: Arc::clone(builder),
                 watcher: graceful.watcher(),
             };
+            // Counted as open until the task below ends.
+            let open = metrics.as_ref().map(|metrics| metrics.accepted());
+            let metrics = metrics.clone();
             // The handshake runs in the connection's task so a slow client can't stall accepts.
             match listener.tls.clone() {
-                None => tokio::spawn(conn.serve(stream)),
+                None => tokio::spawn(async move {
+                    conn.serve(stream).await;
+                    drop(open);
+                }),
                 Some(acceptor) => tokio::spawn(async move {
+                    let _open = open;
+                    let failed = |timed_out| {
+                        if let Some(metrics) = &metrics {
+                            metrics.handshake_failed(timed_out);
+                        }
+                    };
                     let handshake = acceptor.accept(stream);
                     match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, handshake).await {
                         // The handshake is the whole TLS-ALPN-01 answer (RFC 8737 §3).
@@ -245,13 +318,59 @@ impl Server {
                             tracing::debug!(%peer, "answered a TLS-ALPN-01 challenge");
                         }
                         Ok(Ok(stream)) => conn.serve(stream).await,
-                        Ok(Err(e)) => tracing::debug!(%peer, error = %e, "TLS handshake failed"),
-                        Err(_) => tracing::debug!(%peer, "TLS handshake timed out"),
+                        Ok(Err(e)) => {
+                            failed(false);
+                            tracing::debug!(%peer, error = %e, "TLS handshake failed");
+                        }
+                        Err(_) => {
+                            failed(true);
+                            tracing::debug!(%peer, "TLS handshake timed out");
+                        }
                     }
                 }),
             };
         }
     }
+
+    /// Answers scrapes until dropped; without `[metrics]`, waits forever.
+    async fn serve_metrics(&self, builder: &Arc<ConnBuilder>, graceful: &GracefulShutdown) {
+        let (Some(listener), Some(registry)) = (&self.scrape, &self.reloader.registry) else {
+            return std::future::pending().await;
+        };
+        loop {
+            let (stream, peer) = listener.next().await;
+            let registry = Arc::clone(registry);
+            let service = service_fn(move |req| {
+                std::future::ready(Ok::<_, Infallible>(metrics_response(&registry, &req)))
+            });
+            let conn = builder.serve_connection(TokioIo::new(stream), service).into_owned();
+            let conn = graceful.watch(conn);
+            tokio::spawn(async move {
+                if let Err(e) = conn.await {
+                    tracing::debug!(%peer, error = %e, "metrics connection ended with an error");
+                }
+            });
+        }
+    }
+}
+
+/// The content type of [`Metrics::encode`]'s output.
+const OPENMETRICS: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
+
+/// Every metric at `/metrics`; 404 elsewhere.
+fn metrics_response<B>(registry: &Metrics, req: &Request<B>) -> Response<Body> {
+    if req.uri().path() != "/metrics" {
+        return pages::error_response(StatusCode::NOT_FOUND);
+    }
+    if !matches!(*req.method(), Method::GET | Method::HEAD) {
+        let mut res = pages::error_response(StatusCode::METHOD_NOT_ALLOWED);
+        res.headers_mut().insert(ALLOW, HeaderValue::from_static("GET, HEAD"));
+        return res;
+    }
+    Response::builder()
+        .header(CONTENT_TYPE, OPENMETRICS)
+        .body(Body::bytes(registry.encode()))
+        .expect("the content type is a valid header value")
 }
 
 /// An accepted connection, served once any TLS handshake is done.
@@ -259,6 +378,7 @@ struct Connection {
     peer: Peer,
     router: Arc<ArcSwap<Router>>,
     challenges: Option<Arc<Challenges>>,
+    access_log: Option<Arc<AccessLog>>,
     builder: Arc<ConnBuilder>,
     /// Held from accept, so shutdown also waits for handshakes in progress.
     watcher: Watcher,
@@ -269,15 +389,21 @@ impl Connection {
     where
         I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let Self { peer, router, challenges, builder, watcher } = self;
+        let Self { peer, router, challenges, access_log, builder, watcher } = self;
         let service = service_fn(move |req| {
+            let arrived = Instant::now();
+            let logging = access_log
+                .as_ref()
+                .map(|log| (Arc::clone(log), Started::new(&req, peer.addr.ip())));
             let answer = challenges.as_ref().and_then(|challenges| challenges.http_response(&req));
             let router = router.load_full();
             async move {
-                Ok::<_, Infallible>(match answer {
-                    Some(res) => res,
+                let (res, metrics) = match answer {
+                    Some(res) => (res, router.unrouted.clone()),
                     None => router.handle(req, peer).await,
-                })
+                };
+                let entry = logging.map(|(log, started)| Entry::new(log, started, &res));
+                Ok::<_, Infallible>(Observed::wrap(res, arrived, entry, metrics))
             }
         });
         let conn = builder.serve_connection_with_upgrades(TokioIo::new(io), service);
@@ -295,6 +421,8 @@ struct Router {
     client: proxy::Client,
     /// The HTTPS port that plain HTTP requests are redirected to, when there is one.
     https_port: Option<u16>,
+    /// Metrics for responses that reach no site; present with `[metrics]`.
+    unrouted: Option<Arc<SiteMetrics>>,
 }
 
 /// Serves one site's requests.
@@ -304,10 +432,17 @@ struct SiteHandler {
     routes: Vec<Route>,
     /// Hosts whose plain HTTP requests are redirected to HTTPS.
     redirect_hosts: HashSet<String>,
+    /// Present with `[metrics]`, labeled with the site's first host, or `default`.
+    metrics: Option<Arc<SiteMetrics>>,
 }
 
 impl Router {
-    fn new(config: &Config, client: proxy::Client, https_port: Option<u16>) -> io::Result<Self> {
+    fn new(
+        config: &Config,
+        client: proxy::Client,
+        https_port: Option<u16>,
+        registry: Option<&Metrics>,
+    ) -> io::Result<Self> {
         let mut sites = HashMap::new();
         let mut default = None;
         let acme = config.acme.is_some();
@@ -319,13 +454,16 @@ impl Router {
                 })?),
                 None => None,
             };
-            let mut routes: Vec<_> = site.proxies.iter().map(Route::new).collect();
+            let route = |proxy| Route::new(proxy, registry);
+            let mut routes: Vec<_> = site.proxies.iter().map(route).collect();
             routes.sort_by_key(|route| std::cmp::Reverse(route.prefix().len()));
             let redirect_hosts = match https_port {
                 Some(_) if site.redirect_https => site.tls_hosts(acme).cloned().collect(),
                 _ => HashSet::new(),
             };
-            let handler = Arc::new(SiteHandler { files, routes, redirect_hosts });
+            let name = site.hosts.first().map_or("default", String::as_str);
+            let metrics = registry.map(|registry| registry.site(name));
+            let handler = Arc::new(SiteHandler { files, routes, redirect_hosts, metrics });
             for host in &site.hosts {
                 sites.insert(host.clone(), Arc::clone(&handler));
             }
@@ -333,27 +471,35 @@ impl Router {
                 default = Some(handler);
             }
         }
-        Ok(Self { sites, default, client, https_port })
+        let unrouted = registry.map(|registry| registry.site(metrics::NO_SITE));
+        Ok(Self { sites, default, client, https_port, unrouted })
     }
 
-    async fn handle(&self, req: Request<Incoming>, peer: Peer) -> Response<Body> {
+    /// The response, and the metrics of the site that answered.
+    async fn handle(
+        &self,
+        req: Request<Incoming>,
+        peer: Peer,
+    ) -> (Response<Body>, Option<Arc<SiteMetrics>>) {
         let host = match request_host(&req) {
             Ok(host) => host,
-            Err(code) => return pages::error_response(code),
+            Err(code) => return (pages::error_response(code), self.unrouted.clone()),
         };
         let site = host.as_ref().and_then(|host| self.sites.get(host)).or(self.default.as_ref());
         let Some(site) = site else {
-            return pages::error_response(StatusCode::MISDIRECTED_REQUEST);
+            let res = pages::error_response(StatusCode::MISDIRECTED_REQUEST);
+            return (res, self.unrouted.clone());
         };
+        let metrics = site.metrics.clone();
         // Unknown hosts reach the default site but aren't in its `redirect_hosts`, since no
         // cert covers them.
         if let (false, Some(port), Some(host)) = (peer.https, self.https_port, &host)
             && site.redirect_hosts.contains(host)
             && !req.uri().path().starts_with(acme::HTTP_CHALLENGE_PATH)
         {
-            return redirect_to_https(host, port, req.uri());
+            return (redirect_to_https(host, port, req.uri()), metrics);
         }
-        site.handle(req, peer, &self.client).await
+        (site.handle(req, peer, &self.client).await, metrics)
     }
 }
 

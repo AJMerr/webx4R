@@ -20,6 +20,10 @@ pub struct Config {
     pub server: Server,
     /// Automatic certificates; see [`Site::acme_hosts`] for which names get one.
     pub acme: Option<Acme>,
+    /// Log files. Without it, the server log goes to stderr and access logs are off.
+    pub log: Option<Log>,
+    /// The Prometheus endpoint, off without it.
+    pub metrics: Option<Metrics>,
     #[serde(rename = "site", default)]
     pub sites: Vec<Site>,
     /// The folder relative paths resolve against: the config file's folder.
@@ -37,6 +41,39 @@ pub struct Server {
     /// Control socket path on Unix, pipe name (`\\.\pipe\…`) on Windows; resolved like `root`.
     /// See [`Config::control_endpoint`] for the default.
     pub control: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Log {
+    /// Folder for `server.log` and `access.log`, rotated daily; resolved like `root`.
+    pub dir: PathBuf,
+    /// How many days of each log to keep, today's included.
+    #[serde(default = "default_keep_days")]
+    pub keep_days: u32,
+    #[serde(default)]
+    pub access_format: AccessFormat,
+}
+
+fn default_keep_days() -> u32 {
+    14
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AccessFormat {
+    /// One JSON object per line.
+    #[default]
+    Json,
+    /// nginx's `combined` format.
+    Combined,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Metrics {
+    /// Address for `/metrics`, apart from the sites, e.g. `127.0.0.1:9100`.
+    pub listen: SocketAddr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -197,6 +234,9 @@ impl Config {
                 *path = base.join(&*path);
             }
         }
+        if let Some(log) = &mut config.log {
+            log.dir = base.join(&log.dir);
+        }
         for site in &mut config.sites {
             for path in [&mut site.root, &mut site.cert, &mut site.key].into_iter().flatten() {
                 *path = base.join(&*path);
@@ -241,6 +281,16 @@ impl Config {
                 return invalid("[acme] needs `https` in [server]".into());
             }
             validate_acme(acme)?;
+        }
+        if self.log.as_ref().is_some_and(|log| log.keep_days == 0) {
+            return invalid("[log] keep_days must be at least 1".into());
+        }
+        // Port 0 picks a free port, so it can't clash.
+        if let Some(Metrics { listen }) = &self.metrics
+            && listen.port() != 0
+            && [self.server.http, self.server.https].contains(&Some(*listen))
+        {
+            return invalid(format!("[metrics] listen {listen} is already used in [server]"));
         }
         if self.sites.is_empty() {
             return invalid("config needs at least one [[site]]".into());
@@ -724,6 +774,42 @@ mod tests {
             let msg = invalid(&with_site(&proxy("/", &format!("\"{bad}\""))));
             assert!(msg.contains("must be host:port"), "{bad}: {msg}");
         }
+    }
+
+    #[test]
+    fn log_settings_and_defaults() {
+        assert_eq!(parse(MINIMAL).unwrap().log, None, "stderr only without [log]");
+        let config = parse(&format!("{MINIMAL}\n[log]\ndir = \"logs\"")).unwrap();
+        let log = config.log.unwrap();
+        assert_eq!(log.dir, Path::new("/etc/webx4r/logs"));
+        assert_eq!((log.keep_days, log.access_format), (14, AccessFormat::Json));
+
+        let text = format!("{MINIMAL}\n[log]\ndir = \"/var/log/webx4r\"\nkeep_days = 30\n");
+        let config = parse(&(text + "access_format = \"combined\"")).unwrap();
+        let log = config.log.unwrap();
+        assert_eq!(log.dir, Path::new("/var/log/webx4r"));
+        assert_eq!((log.keep_days, log.access_format), (30, AccessFormat::Combined));
+    }
+
+    #[test]
+    fn log_settings_are_validated() {
+        let no_dir = parse(&format!("{MINIMAL}\n[log]\nkeep_days = 7"));
+        assert!(matches!(no_dir, Err(ConfigError::Parse(_))), "`dir` is required");
+        let msg = invalid(&format!("{MINIMAL}\n[log]\ndir = \"logs\"\nkeep_days = 0"));
+        assert_eq!(msg, "[log] keep_days must be at least 1");
+        let format = parse(&format!("{MINIMAL}\n[log]\ndir = \"logs\"\naccess_format = \"xml\""));
+        assert!(matches!(format, Err(ConfigError::Parse(_))));
+    }
+
+    #[test]
+    fn metrics_listen_is_its_own_address() {
+        assert_eq!(parse(MINIMAL).unwrap().metrics, None, "off without [metrics]");
+        let config = parse(&format!("{MINIMAL}\n[metrics]\nlisten = \"127.0.0.1:9100\"")).unwrap();
+        assert_eq!(config.metrics.unwrap().listen, "127.0.0.1:9100".parse().unwrap());
+        let msg = invalid(&format!("{MINIMAL}\n[metrics]\nlisten = \"0.0.0.0:8080\""));
+        assert_eq!(msg, "[metrics] listen 0.0.0.0:8080 is already used in [server]");
+        let any_port = MINIMAL.replace("0.0.0.0:8080", "127.0.0.1:0");
+        parse(&format!("{any_port}\n[metrics]\nlisten = \"127.0.0.1:0\"")).unwrap();
     }
 
     #[test]

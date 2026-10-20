@@ -215,11 +215,14 @@ async fn slow_upstream_is_a_gateway_timeout() {
 }
 
 fn route(prefix: &str) -> Route {
-    Route::new(&config::Proxy {
-        path: prefix.to_owned(),
-        upstreams: vec!["127.0.0.1:9".to_owned()],
-        strip_prefix: true,
-    })
+    Route::new(
+        &config::Proxy {
+            path: prefix.to_owned(),
+            upstreams: vec!["127.0.0.1:9".to_owned()],
+            strip_prefix: true,
+        },
+        None,
+    )
 }
 
 #[test]
@@ -248,11 +251,14 @@ async fn path_less_requests_are_rejected() {
 
 /// A route for `/` over `upstreams`.
 fn balanced(upstreams: &[&String]) -> Route {
-    Route::new(&config::Proxy {
-        path: "/".to_owned(),
-        upstreams: upstreams.iter().map(|u| u.to_string()).collect(),
-        strip_prefix: false,
-    })
+    Route::new(
+        &config::Proxy {
+            path: "/".to_owned(),
+            upstreams: upstreams.iter().map(|u| u.to_string()).collect(),
+            strip_prefix: false,
+        },
+        None,
+    )
 }
 
 /// Sends `req` through `route` and returns the `x-upstream` that answered.

@@ -1,11 +1,13 @@
 use std::fs;
 use std::net::SocketAddr;
+use std::sync::Mutex;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty};
 use hyper_util::rt::TokioExecutor;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
+use serde_json::json;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -23,10 +25,14 @@ use crate::tls::tests::write_pair;
 struct Running {
     http: Option<SocketAddr>,
     https: Option<SocketAddr>,
+    scrape: Option<SocketAddr>,
     stop: Option<oneshot::Sender<()>>,
     done: tokio::task::JoinHandle<()>,
     reloader: Reloader,
     challenges: Option<Arc<Challenges>>,
+    metrics: Option<Arc<Metrics>>,
+    /// Every access log entry so far, in JSON.
+    access: Arc<Mutex<Vec<serde_json::Value>>>,
     /// The config text the server started with.
     config: String,
     dir: TempDir,
@@ -73,16 +79,52 @@ impl Running {
         }
         let config = Config::parse(text, dir.path()).unwrap();
 
-        let server = Server::bind(&config).await.unwrap();
-        let (http, https) = (server.http_addr(), server.https_addr());
+        let mut server = Server::bind(&config).await.unwrap();
+        let access = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&access);
+        server.set_access_log(AccessLog::new(config::AccessFormat::Json, move |line| {
+            sink.lock().unwrap().push(serde_json::from_slice(line).unwrap());
+        }));
+        let (http, https, scrape) =
+            (server.http_addr(), server.https_addr(), server.metrics_addr());
         let reloader = server.reloader();
-        let challenges = server.challenges.clone();
+        let (challenges, metrics) = (server.challenges.clone(), server.metrics());
         let (stop, stopped) = oneshot::channel();
         let done = tokio::spawn(server.run(async {
             let _ = stopped.await;
         }));
         let config = text.to_owned();
-        Self { http, https, stop: Some(stop), done, reloader, challenges, config, dir }
+        let stop = Some(stop);
+        Self { http, https, scrape, stop, done, reloader, challenges, metrics, access, config, dir }
+    }
+
+    /// Waits briefly for the metrics to contain every line in `lines`: like an access log
+    /// entry, a response is counted when its body is dropped.
+    async fn wait_for_metrics(&self, lines: &[&str]) {
+        let metrics = self.metrics.as_ref().expect("the config has [metrics]");
+        for _ in 0..100 {
+            let text = metrics.encode();
+            if lines.iter().all(|line| text.contains(&format!("{line}\n"))) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("expected {lines:#?} in:\n{}", metrics.encode());
+    }
+
+    /// The first `n` access log entries, waiting briefly: an entry is written when its body
+    /// is dropped, which can come just after the client has the whole response.
+    async fn access_entries(&self, n: usize) -> Vec<serde_json::Value> {
+        for _ in 0..100 {
+            {
+                let entries = self.access.lock().unwrap();
+                if entries.len() >= n {
+                    return entries[..n].to_vec();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("fewer than {n} entries: {:?}", self.access.lock().unwrap());
     }
 
     /// Reloads with `config`, resolved against the same folder as the first one.
@@ -114,11 +156,7 @@ impl Running {
 
     /// Sends a raw HTTP/1.1 request and returns the whole response as text.
     async fn raw(&self, request: &str) -> String {
-        let mut stream = TcpStream::connect(self.http.unwrap()).await.unwrap();
-        stream.write_all(request.as_bytes()).await.unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).await.unwrap();
-        response
+        raw_at(self.http.unwrap(), request).await
     }
 
     async fn get(&self, host: &str) -> String {
@@ -133,6 +171,15 @@ impl Running {
         self.stop.take().unwrap().send(()).unwrap();
         self.done.await.unwrap();
     }
+}
+
+/// Sends a raw request to `addr` and returns the whole response as text.
+async fn raw_at(addr: SocketAddr, request: &str) -> String {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    response
 }
 
 /// Sends `GET https://{host}/` with the protocol ALPN chose; returns the version and body.
@@ -258,6 +305,146 @@ async fn routes_paths_to_proxies_and_static_files() {
     let other = server.get_path("a.test", "/apix").await;
     assert!(other.starts_with("HTTP/1.1 404"), "not a proxy path: {other}");
     server.stop().await;
+}
+
+#[tokio::test]
+async fn access_log_records_files_proxied_and_redirected_responses() {
+    let upstream = echo_upstream().await;
+    // Joins the last site, b.test.
+    let sites = format!("[[site.proxy]]\npath = \"/\"\nupstreams = [\"{upstream}\"]\n");
+    let server = Running::start_tls_with(true, &sites).await;
+    let (_, body) = get_tls(server.tls("a.test", b"h2").await, "a.test").await;
+    assert_eq!(body, "site a");
+    let echoed = get_tls(server.tls("b.test", b"http/1.1").await, "b.test").await.1;
+    let redirect = server.get_path("a.test", "/old?x=1").await;
+    assert!(redirect.starts_with("HTTP/1.1 308"), "{redirect}");
+
+    let entries = server.access_entries(3).await;
+    let find = |uri: &str| entries.iter().find(|entry| entry["uri"] == uri).unwrap();
+    let file = find("/");
+    assert_eq!((&file["host"], &file["protocol"]), (&json!("a.test"), &json!("HTTP/2.0")));
+    assert_eq!((&file["status"], &file["bytes"]), (&json!(200), &json!(6)));
+    assert_eq!(file["client"], "127.0.0.1");
+    let proxied = &entries.iter().find(|entry| entry["host"] == "b.test").unwrap();
+    assert_eq!(proxied["upstream"], upstream.as_str(), "{proxied}");
+    assert_eq!(proxied["bytes"], echoed.len());
+    let redirected = find("/old?x=1");
+    assert_eq!((&redirected["status"], &redirected["bytes"]), (&json!(308), &json!(0)));
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn metrics_count_responses_per_site_across_reloads() {
+    let text = "[server]\nhttp = \"127.0.0.1:0\"\n[[site]]\nhosts = [\"a.test\"]\nroot = \"a\"\n\
+                [[site]]\nroot = \"fallback\"\ndefault = true\n\
+                [metrics]\nlisten = \"127.0.0.1:0\"\n";
+    let server = Running::start_with(tempfile::tempdir().unwrap(), text).await;
+    server.get("a.test").await;
+    server.get_path("a.test", "/missing").await;
+    server.get("unknown.test").await;
+    server.raw("GET / HTTP/1.1\r\nConnection: close\r\n\r\n").await;
+    server
+        .wait_for_metrics(&[
+            "webx4r_http_responses_total{site=\"a.test\",code=\"2xx\"} 1",
+            "webx4r_http_responses_total{site=\"a.test\",code=\"4xx\"} 1",
+            "webx4r_http_responses_total{site=\"default\",code=\"2xx\"} 1",
+            "webx4r_http_responses_total{site=\"none\",code=\"4xx\"} 1",
+            "webx4r_http_response_body_bytes_total{site=\"default\"} 8",
+        ])
+        .await;
+
+    server.reload(text).unwrap();
+    server.get("a.test").await;
+    let line = "webx4r_http_responses_total{site=\"a.test\",code=\"2xx\"} 2";
+    server.wait_for_metrics(&[line]).await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn metrics_count_connections_failures_and_reloads() {
+    let unreachable = closed_port().await;
+    // The proxy joins the last site, b.test.
+    let extra = format!(
+        "[[site.proxy]]\npath = \"/\"\nupstreams = [\"{unreachable}\"]\n\
+         [metrics]\nlisten = \"127.0.0.1:0\"\n"
+    );
+    let server = Running::start_tls_with(true, &extra).await;
+    let mut plain = TcpStream::connect(server.https.unwrap()).await.unwrap();
+    plain.write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await.unwrap();
+    // The server drops the connection; a reset instead of a clean close is fine.
+    let _ = plain.read_to_end(&mut Vec::new()).await;
+    let (_, body) = get_tls(server.tls("b.test", b"h2").await, "b.test").await;
+    assert!(String::from_utf8_lossy(&body).contains("502"), "{body:?}");
+    assert!(server.get("a.test").await.starts_with("HTTP/1.1 308"));
+    server.reload(&server.config).unwrap();
+    server.reload(&server.config.replace("root = \"a\"", "root = \"missing\"")).unwrap_err();
+
+    let upstream = format!(
+        "webx4r_proxy_upstream_failures_total{{upstream=\"{unreachable}\",kind=\"connect\"}} 1"
+    );
+    server
+        .wait_for_metrics(&[
+            "webx4r_connections_total{listener=\"http\"} 1",
+            "webx4r_connections_total{listener=\"https\"} 2",
+            "webx4r_connections_open{listener=\"http\"} 0",
+            "webx4r_tls_handshake_failures_total{reason=\"error\"} 1",
+            &upstream,
+            "webx4r_config_reloads_total{result=\"ok\"} 1",
+            "webx4r_config_reloads_total{result=\"error\"} 1",
+        ])
+        .await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn no_metrics_without_the_table() {
+    let server = Running::start(false).await;
+    assert!(server.metrics.is_none() && server.scrape.is_none());
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn serves_metrics_on_their_own_listener() {
+    let text = "[server]\nhttp = \"127.0.0.1:0\"\n[[site]]\nhosts = [\"a.test\"]\nroot = \"a\"\n\
+                [metrics]\nlisten = \"127.0.0.1:0\"\n";
+    let server = Running::start_with(tempfile::tempdir().unwrap(), text).await;
+    server.get("a.test").await;
+    let counted = "webx4r_http_responses_total{site=\"a.test\",code=\"2xx\"} 1";
+    server.wait_for_metrics(&[counted]).await;
+    let scrape = server.scrape.unwrap();
+    let request = |method: &str, path: &str| {
+        let request = format!("{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        async move { raw_at(scrape, &request).await }
+    };
+
+    let res = request("GET", "/metrics").await;
+    assert!(res.starts_with("HTTP/1.1 200 OK\r\n"), "{res}");
+    assert!(res.contains(&format!("\r\ncontent-type: {OPENMETRICS}\r\n")), "{res}");
+    assert!(res.contains(&format!("\n{counted}\n")) && res.ends_with("# EOF\n"), "{res}");
+    let head = request("HEAD", "/metrics").await;
+    assert!(head.contains("\r\ncontent-length: ") && head.ends_with("\r\n\r\n"), "{head}");
+    let post = request("POST", "/metrics").await;
+    assert!(
+        post.starts_with("HTTP/1.1 405") && post.contains("\r\nallow: GET, HEAD\r\n"),
+        "{post}"
+    );
+    let other = request("GET", "/").await;
+    assert!(other.starts_with("HTTP/1.1 404"), "{other}");
+
+    // Scrapes aren't site traffic: they're neither counted nor logged.
+    let res = request("GET", "/metrics").await;
+    assert!(res.contains(&format!("\n{counted}\n")), "{res}");
+    assert!(res.contains("\nwebx4r_connections_total{listener=\"http\"} 1\n"), "{res}");
+    assert_eq!(server.access.lock().unwrap().len(), 1);
+
+    // An idle keep-alive scrape connection doesn't hold up shutdown.
+    let stream = TcpStream::connect(scrape).await.unwrap();
+    let (mut sender, conn) =
+        hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.unwrap();
+    tokio::spawn(conn);
+    let req = Request::get("/metrics").body(Empty::<Bytes>::new()).unwrap();
+    assert_eq!(sender.send_request(req).await.unwrap().status(), StatusCode::OK);
+    tokio::time::timeout(Duration::from_secs(5), server.stop()).await.unwrap();
 }
 
 #[tokio::test]
@@ -586,12 +773,18 @@ async fn serves_saved_acme_certs_at_startup() {
 
     let text = format!(
         "[server]\nhttps = \"127.0.0.1:0\"\n[[site]]\nhosts = [\"a.test\"]\nroot = \"a\"\n\
-         [acme]\ndirectory = \"{directory}\"\nstorage = \"state\"\n"
+         [acme]\ndirectory = \"{directory}\"\nstorage = \"state\"\n\
+         [metrics]\nlisten = \"127.0.0.1:0\"\n"
     );
     let server = Running::start_with(dir, &text).await;
     let (leaf, body) = served(server.https.unwrap(), "a.test").await;
     assert_eq!(&leaf, saved.cert.der());
     assert_eq!(body, "site a");
+    // rcgen's default expiry.
+    let expires = rcgen::date_time_ymd(4096, 1, 1).unix_timestamp();
+    let expiry =
+        format!("webx4r_acme_certificate_expiry_timestamp_seconds{{name=\"a.test\"}} {expires}");
+    server.wait_for_metrics(&[&expiry]).await;
     server.stop().await;
 }
 
@@ -604,6 +797,20 @@ async fn reload_rejects_acme_changes() {
         let err = server.reload(&config).unwrap_err().to_string();
         assert_eq!(err, "[acme] settings changed; restart to apply them");
     }
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn reload_rejects_log_and_metrics_changes() {
+    let server = Running::start(false).await;
+    for (table, added) in [
+        ("[log]", "[log]\ndir = \"logs\"\n"),
+        ("[metrics]", "[metrics]\nlisten = \"127.0.0.1:9100\"\n"),
+    ] {
+        let err = server.reload(&format!("{}{added}", server.config)).unwrap_err();
+        assert_eq!(err.to_string(), format!("{table} settings changed; restart to apply them"));
+    }
+    assert!(server.get("a.test").await.ends_with("site a"), "the old config stays");
     server.stop().await;
 }
 

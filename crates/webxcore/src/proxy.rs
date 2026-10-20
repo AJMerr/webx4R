@@ -23,6 +23,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use webxlib::body::Body;
 
 use crate::config;
+use crate::metrics::{Metrics, UpstreamMetrics};
 
 /// How long an upstream gets to accept a TCP connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -254,10 +255,16 @@ pub struct Route {
     epoch: Instant,
 }
 
+/// A response extension naming the upstream that answered, for the access log.
+#[derive(Debug, Clone)]
+pub struct Answered(pub Arc<str>);
+
 struct Upstream {
-    addr: String,
+    addr: Arc<str>,
     /// Milliseconds after the route's epoch until which this upstream is skipped; 0 when up.
     down_until: AtomicU64,
+    /// Present with `[metrics]`.
+    metrics: Option<UpstreamMetrics>,
 }
 
 impl Upstream {
@@ -278,11 +285,12 @@ impl Upstream {
 }
 
 impl Route {
-    pub fn new(config: &config::Proxy) -> Self {
-        let upstreams = config
-            .upstreams
-            .iter()
-            .map(|addr| Upstream { addr: addr.clone(), down_until: AtomicU64::new(0) });
+    pub fn new(config: &config::Proxy, registry: Option<&Metrics>) -> Self {
+        let upstreams = config.upstreams.iter().map(|addr| Upstream {
+            addr: addr.as_str().into(),
+            down_until: AtomicU64::new(0),
+            metrics: registry.map(|registry| registry.upstream(addr)),
+        });
         Self {
             prefix: config.path.clone(),
             upstreams: upstreams.collect(),
@@ -324,12 +332,16 @@ impl Route {
         for upstream in self.candidates() {
             let body = Reclaimable { slot: Arc::clone(&slot), body: None };
             let error = match client.send(&head, body, &upstream.addr).await {
-                Ok(res) => {
+                Ok(mut res) => {
                     upstream.mark_up();
+                    res.extensions_mut().insert(Answered(Arc::clone(&upstream.addr)));
                     return Ok(res);
                 }
                 Err(e) => e,
             };
+            if let Some(metrics) = &upstream.metrics {
+                metrics.failed(&error);
+            }
             tracing::warn!(upstream = %upstream.addr, client = %peer.addr, %error, "proxy request failed");
             if matches!(error, ProxyError::Connect(_) | ProxyError::Timeout) {
                 upstream.mark_down(self.now());
