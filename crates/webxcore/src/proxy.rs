@@ -15,10 +15,11 @@ use http::uri::PathAndQuery;
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Uri, Version};
 use http_body_util::BodyExt;
 use http_body_util::combinators::UnsyncBoxBody;
-use hyper::body::{Frame, SizeHint};
+use hyper::body::{Frame, Incoming, SizeHint};
+use hyper::upgrade::OnUpgrade;
 use hyper_util::client::legacy;
 use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::{TokioExecutor, TokioTimer};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use webxlib::body::Body;
 
 use crate::config;
@@ -56,12 +57,16 @@ pub enum ProxyError {
     Upstream(legacy::Error),
     /// The request can't be addressed to an upstream, e.g. `OPTIONS *`.
     BadRequest,
+    /// The upstream switched protocols on a request that didn't ask to.
+    UnexpectedUpgrade,
 }
 
 impl ProxyError {
     pub fn status(&self) -> StatusCode {
         match self {
-            Self::Connect(_) | Self::Upstream(_) => StatusCode::BAD_GATEWAY,
+            Self::Connect(_) | Self::Upstream(_) | Self::UnexpectedUpgrade => {
+                StatusCode::BAD_GATEWAY
+            }
             Self::Timeout => StatusCode::GATEWAY_TIMEOUT,
             Self::BadRequest => StatusCode::BAD_REQUEST,
         }
@@ -85,6 +90,7 @@ impl fmt::Display for ProxyError {
             Self::Timeout => write!(f, "no response within {RESPONSE_TIMEOUT:?}"),
             Self::Upstream(e) => write!(f, "upstream failed: {}", detail(e)),
             Self::BadRequest => f.write_str("request has no path to forward"),
+            Self::UnexpectedUpgrade => f.write_str("upstream switched protocols unasked"),
         }
     }
 }
@@ -152,6 +158,9 @@ impl Client {
             Ok(Err(e)) => return Err(ProxyError::Upstream(e)),
             Err(_) => return Err(ProxyError::Timeout),
         };
+        if res.status() == StatusCode::SWITCHING_PROTOCOLS {
+            return switch_protocols(res, head.extensions.get::<OnUpgrade>().cloned(), upstream);
+        }
 
         let (mut parts, body) = res.into_parts();
         remove_hop_by_hop(&mut parts.headers);
@@ -173,9 +182,13 @@ fn prepare<B>(req: Request<B>, peer: Peer) -> Result<(Parts, B), ProxyError> {
         Some(authority) => HeaderValue::from_str(authority.as_str()).ok(),
         None => parts.headers.get(HOST).cloned(),
     };
+    let upgrade = upgrade_protocol(&parts);
 
     let headers = &mut parts.headers;
     remove_hop_by_hop(headers);
+    if let Some(protocol) = upgrade {
+        set_upgrade(headers, protocol);
+    }
     if let Some(host) = host {
         headers.insert(HOST, host.clone());
         headers.insert(X_FORWARDED_HOST, host);
@@ -184,6 +197,50 @@ fn prepare<B>(req: Request<B>, peer: Peer) -> Result<(Parts, B), ProxyError> {
     let proto = HeaderValue::from_static(if peer.https { "https" } else { "http" });
     headers.insert(X_FORWARDED_PROTO, proto);
     Ok((parts, body))
+}
+
+/// The `Upgrade` value of an HTTP/1.1 request that asks to switch protocols, e.g. `websocket`.
+fn upgrade_protocol(parts: &Parts) -> Option<HeaderValue> {
+    let asks = parts.version == Version::HTTP_11
+        && connection_tokens(&parts.headers).any(|token| token.eq_ignore_ascii_case("upgrade"));
+    asks.then(|| parts.headers.get(UPGRADE).cloned()).flatten()
+}
+
+fn set_upgrade(headers: &mut HeaderMap, protocol: HeaderValue) {
+    headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+    headers.insert(UPGRADE, protocol);
+}
+
+/// Passes the upstream's `101` on to the client, then relays bytes between the two upgraded
+/// connections until either side closes.
+fn switch_protocols(
+    mut res: Response<Incoming>,
+    client: Option<OnUpgrade>,
+    upstream: &str,
+) -> Result<Response<Body>, ProxyError> {
+    let Some(client) = client else { return Err(ProxyError::UnexpectedUpgrade) };
+    let upstream_side = hyper::upgrade::on(&mut res);
+    let upstream = upstream.to_owned();
+    tokio::spawn(async move {
+        let relay = async {
+            let (client, upstream) = tokio::try_join!(client, upstream_side)?;
+            let (mut client, mut upstream) = (TokioIo::new(client), TokioIo::new(upstream));
+            tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+            Ok::<_, BoxError>(())
+        };
+        if let Err(e) = relay.await {
+            tracing::debug!(%upstream, error = %e, "upgraded connection ended with an error");
+        }
+    });
+
+    let (mut parts, _) = res.into_parts();
+    let protocol = parts.headers.get(UPGRADE).cloned();
+    remove_hop_by_hop(&mut parts.headers);
+    if let Some(protocol) = protocol {
+        set_upgrade(&mut parts.headers, protocol);
+    }
+    parts.version = Version::default();
+    Ok(Response::from_parts(parts, Body::empty()))
 }
 
 /// A site's `[[site.proxy]]`: requests at or below `prefix` go to its upstreams in turn.
@@ -365,12 +422,8 @@ fn strip_prefix(uri: &Uri, prefix: &str) -> Result<Uri, ProxyError> {
 /// Removes headers that apply to a single connection (RFC 9110 §7.6.1),
 /// including any that `Connection` names.
 fn remove_hop_by_hop(headers: &mut HeaderMap) {
-    let named: Vec<HeaderName> = headers
-        .get_all(CONNECTION)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .filter_map(|name| HeaderName::from_bytes(name.trim().as_bytes()).ok())
+    let named: Vec<HeaderName> = connection_tokens(headers)
+        .filter_map(|name| HeaderName::from_bytes(name.as_bytes()).ok())
         .collect();
     for name in named {
         headers.remove(name);
@@ -380,6 +433,16 @@ fn remove_hop_by_hop(headers: &mut HeaderMap) {
     for name in fixed.into_iter().chain(legacy) {
         headers.remove(name);
     }
+}
+
+/// The comma-separated names in every `Connection` header.
+fn connection_tokens(headers: &HeaderMap) -> impl Iterator<Item = &str> {
+    headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
 }
 
 /// Adds the client's address to the end of `X-Forwarded-For`.

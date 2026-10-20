@@ -1,3 +1,4 @@
+use std::convert::Infallible;
 use std::net::Ipv4Addr;
 
 use http_body_util::Full;
@@ -42,6 +43,36 @@ async fn echo(req: Request<Incoming>, name: String) -> Result<Response<Full<Byte
         .header("x-app", "echo")
         .header("x-upstream", name);
     Ok(res.body(Full::new(Bytes::from(text))).unwrap())
+}
+
+/// Starts an upstream that accepts any `Upgrade` with a 101, then echoes bytes back.
+pub(crate) async fn upgrade_upstream() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let conn = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service_fn(switch))
+                .with_upgrades();
+            tokio::spawn(conn);
+        }
+    });
+    addr
+}
+
+async fn switch(mut req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+    let protocol = req.headers()[UPGRADE].clone();
+    let upgrade = hyper::upgrade::on(&mut req);
+    tokio::spawn(async move {
+        let (mut reader, mut writer) = tokio::io::split(TokioIo::new(upgrade.await.unwrap()));
+        tokio::io::copy(&mut reader, &mut writer).await
+    });
+    let res = Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(CONNECTION, "upgrade")
+        .header(UPGRADE, protocol);
+    Ok(res.body(Full::default()).unwrap())
 }
 
 /// An address with nothing listening on it.
@@ -124,6 +155,29 @@ async fn removes_hop_by_hop_headers() {
 
     assert!(!res.headers().contains_key("keep-alive"), "response hop-by-hop header kept");
     assert_eq!(res.headers()["x-app"], "echo");
+}
+
+#[tokio::test]
+async fn keeps_upgrade_headers_only_when_asked() {
+    let upstream = echo_upstream().await;
+    let asked = get("/").header("connection", "keep-alive, Upgrade").header("upgrade", "websocket");
+    let body = forward(asked.body(Full::default()).unwrap(), &upstream).await.into_body();
+    assert!(body.contains("\nconnection: upgrade\n"), "{body}");
+    assert!(body.contains("\nupgrade: websocket\n"), "{body}");
+
+    let unasked = get("/").header("upgrade", "websocket");
+    let body = forward(unasked.body(Full::default()).unwrap(), &upstream).await.into_body();
+    assert!(!body.contains("\nupgrade:"), "{body}");
+}
+
+#[tokio::test]
+async fn upgrade_without_a_client_connection_is_a_bad_gateway() {
+    let upstream = upgrade_upstream().await;
+    let req = get("/").header("connection", "upgrade").header("upgrade", "websocket");
+    let req = req.body(Full::default()).unwrap();
+    let err = Client::default().forward(req, &upstream, PEER).await.err().unwrap();
+    assert!(matches!(err, ProxyError::UnexpectedUpgrade), "{err:?}");
+    assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
 }
 
 #[tokio::test]

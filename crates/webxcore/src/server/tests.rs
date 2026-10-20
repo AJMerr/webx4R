@@ -14,7 +14,7 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
 use super::*;
-use crate::proxy::tests::echo_upstream;
+use crate::proxy::tests::{echo_upstream, upgrade_upstream};
 use crate::tls::tests::write_pair;
 
 /// A running server on random ports with sites `a.test`, `b.test` and optionally a default.
@@ -252,6 +252,38 @@ async fn proxies_https_requests_to_http_upstreams() {
     assert_eq!(version, Version::HTTP_2);
     assert!(body.contains("\nhost: a.test\n"), "{body}");
     assert!(body.contains("\nx-forwarded-proto: https\n"), "{body}");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn upgrades_are_relayed_both_ways() {
+    let upstream = upgrade_upstream().await;
+    let text = format!(
+        "[server]\nhttp = \"127.0.0.1:0\"\n[[site]]\nhosts = [\"a.test\"]\n\
+         [[site.proxy]]\npath = \"/ws\"\nupstreams = [\"{upstream}\"]\n"
+    );
+    let server = Running::start_with(tempfile::tempdir().unwrap(), &text).await;
+    let mut stream = TcpStream::connect(server.http.unwrap()).await.unwrap();
+    let request =
+        "GET /ws HTTP/1.1\r\nHost: a.test\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n";
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        head.push(stream.read_u8().await.unwrap());
+    }
+    let head = String::from_utf8(head).unwrap().to_ascii_lowercase();
+    assert!(head.starts_with("http/1.1 101 switching protocols"), "{head}");
+    assert!(head.contains("\r\nconnection: upgrade\r\n"), "{head}");
+    assert!(head.contains("\r\nupgrade: echo\r\n"), "{head}");
+
+    for message in ["ping", "pong"] {
+        stream.write_all(message.as_bytes()).await.unwrap();
+        let mut reply = [0; 4];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, message.as_bytes());
+    }
+    drop(stream);
     server.stop().await;
 }
 
