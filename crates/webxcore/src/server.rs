@@ -29,7 +29,7 @@ use webxlib::static_files::StaticFiles;
 
 use crate::config::{self, Config};
 use crate::proxy::{self, Peer, Route};
-use crate::tls;
+use crate::tls::CertStore;
 
 /// How long shutdown waits for in-flight requests before dropping them.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -55,19 +55,29 @@ pub struct Reloader {
     router: Arc<ArcSwap<Router>>,
     /// Outlives reloads, so connections to unchanged upstreams stay pooled.
     client: proxy::Client,
+    /// Present when serving HTTPS.
+    certs: Option<Arc<CertStore>>,
     /// The `[server]` table, which only a restart can change.
     server: config::Server,
 }
 
 impl Reloader {
-    /// Builds the new config's sites and swaps them in; on error, the old config stays.
+    /// Builds the new config's sites and certificates, then swaps them in;
+    /// on error, the old config stays.
     pub fn reload(&self, config: &Config) -> io::Result<()> {
         if config.server != self.server {
             let msg = "[server] settings changed; restart to apply them";
             return Err(io::Error::new(io::ErrorKind::InvalidInput, msg));
         }
         let router = Router::new(config, self.client.clone())?;
+        let certs = match &self.certs {
+            Some(store) => Some((store, store.load(config)?)),
+            None => None,
+        };
         self.router.store(Arc::new(router));
+        if let Some((store, certs)) = certs {
+            store.store(certs);
+        }
         Ok(())
     }
 }
@@ -93,11 +103,17 @@ impl Server {
     pub async fn bind(config: &Config) -> io::Result<Self> {
         let client = proxy::Client::default();
         let router = Arc::new(ArcSwap::from_pointee(Router::new(config, client.clone())?));
-        let reloader = Reloader { router, client, server: config.server.clone() };
-        let https = match config.server.https {
-            Some(addr) => Some((addr, TlsAcceptor::from(Arc::new(tls::server_config(config)?)))),
+        let certs = match config.server.https {
+            Some(_) => Some(Arc::new(CertStore::new(config)?)),
             None => None,
         };
+        let https = match (config.server.https, &certs) {
+            (Some(addr), Some(certs)) => {
+                Some((addr, TlsAcceptor::from(Arc::new(certs.server_config()))))
+            }
+            _ => None,
+        };
+        let reloader = Reloader { router, client, certs, server: config.server.clone() };
         let http = match config.server.http {
             Some(addr) => Some(Listener::bind(addr, None).await?),
             None => None,
