@@ -1,8 +1,11 @@
-//! Automatic certificates over ACME (RFC 8555): the account, the files it keeps, and the
-//! answers to the CA's challenges.
+//! Automatic certificates over ACME (RFC 8555): the account, the files it keeps, the
+//! answers to the CA's challenges, and the [`Manager`] that orders and renews certs.
 
+mod manager;
 #[cfg(test)]
 pub(crate) mod tests;
+
+pub use manager::{Connector, Handle, Manager};
 
 use std::collections::HashMap;
 use std::fmt::Display;

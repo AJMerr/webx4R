@@ -27,7 +27,7 @@ use webxlib::body::Body;
 use webxlib::pages;
 use webxlib::static_files::StaticFiles;
 
-use crate::acme::{ACME_TLS_ALPN, Challenges};
+use crate::acme::{self, ACME_TLS_ALPN, Challenges};
 use crate::config::{self, Config};
 use crate::proxy::{self, Peer, Route};
 use crate::tls::CertStore;
@@ -47,8 +47,9 @@ pub struct Server {
     http: Option<Listener>,
     https: Option<Listener>,
     reloader: Reloader,
-    /// Present with `[acme]`.
+    /// Present with `[acme]`, like `manager`.
     challenges: Option<Arc<Challenges>>,
+    manager: Option<acme::Manager>,
 }
 
 /// Applies a new config to a running [`Server`].
@@ -60,17 +61,26 @@ pub struct Reloader {
     client: proxy::Client,
     /// Present when serving HTTPS.
     certs: Option<Arc<CertStore>>,
-    /// The `[server]` table, which only a restart can change.
+    /// The `[server]` and `[acme]` tables, which only a restart can change.
     server: config::Server,
+    acme: Option<config::Acme>,
+    /// Tells the ACME manager which names the new config needs certs for.
+    manager: Option<acme::Handle>,
 }
 
 impl Reloader {
     /// Builds the new config's sites and certificates, then swaps them in;
     /// on error, the old config stays.
     pub fn reload(&self, config: &Config) -> io::Result<()> {
+        let restart = |table| {
+            let msg = format!("{table} settings changed; restart to apply them");
+            Err(io::Error::new(io::ErrorKind::InvalidInput, msg))
+        };
         if config.server != self.server {
-            let msg = "[server] settings changed; restart to apply them";
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, msg));
+            return restart("[server]");
+        }
+        if config.acme != self.acme {
+            return restart("[acme]");
         }
         let router = Router::new(config, self.client.clone())?;
         let certs = match &self.certs {
@@ -80,6 +90,9 @@ impl Reloader {
         self.router.store(Arc::new(router));
         if let Some((store, certs)) = certs {
             store.store(certs);
+        }
+        if let Some(manager) = &self.manager {
+            manager.update(config);
         }
         Ok(())
     }
@@ -104,6 +117,11 @@ impl Listener {
 impl Server {
     /// Opens every site root and loads every cert, then binds the listeners.
     pub async fn bind(config: &Config) -> io::Result<Self> {
+        Self::bind_with(config, Arc::new(instant_acme::Account::builder)).await
+    }
+
+    /// Like [`Server::bind`], reaching the ACME server through `connector`.
+    pub(crate) async fn bind_with(config: &Config, connector: acme::Connector) -> io::Result<Self> {
         let client = proxy::Client::default();
         let router = Arc::new(ArcSwap::from_pointee(Router::new(config, client.clone())?));
         let challenges = config.acme.as_ref().map(|_| Arc::new(Challenges::default()));
@@ -117,7 +135,21 @@ impl Server {
             }
             _ => None,
         };
-        let reloader = Reloader { router, client, certs, server: config.server.clone() };
+        let manager = match (&challenges, &certs) {
+            (Some(challenges), Some(certs)) => {
+                acme::Manager::new(config, connector, Arc::clone(challenges), Arc::clone(certs))
+            }
+            _ => None,
+        };
+        let (manager, handle) = manager.unzip();
+        let reloader = Reloader {
+            router,
+            client,
+            certs,
+            server: config.server.clone(),
+            acme: config.acme.clone(),
+            manager: handle,
+        };
         let http = match config.server.http {
             Some(addr) => Some(Listener::bind(addr, None).await?),
             None => None,
@@ -126,7 +158,7 @@ impl Server {
             Some((addr, acceptor)) => Some(Listener::bind(addr, Some(acceptor)).await?),
             None => None,
         };
-        Ok(Self { http, https, reloader, challenges })
+        Ok(Self { http, https, reloader, challenges, manager })
     }
 
     /// A handle for reloading the config while [`Server::run`] serves.
@@ -142,18 +174,26 @@ impl Server {
         self.https.as_ref().map(|listener| listener.addr)
     }
 
-    /// Serves until `shutdown` resolves, then lets in-flight requests finish.
-    pub async fn run(self, shutdown: impl Future<Output = ()>) {
+    /// Serves, and keeps ACME certs issued, until `shutdown` resolves; then lets in-flight
+    /// requests finish.
+    pub async fn run(mut self, shutdown: impl Future<Output = ()>) {
         let mut builder = auto::Builder::new(TokioExecutor::new());
         // Enables hyper's header-read timeout, which guards against slow-header attacks.
         builder.http1().timer(TokioTimer::new());
         let builder = Arc::new(builder);
         let graceful = GracefulShutdown::new();
 
+        let manager = self.manager.take();
+        let acme = async {
+            match manager {
+                Some(manager) => manager.run().await,
+                None => std::future::pending().await,
+            }
+        };
         let http = self.accept(self.http.as_ref(), &builder, &graceful);
         let https = self.accept(self.https.as_ref(), &builder, &graceful);
         tokio::select! {
-            _ = async { tokio::join!(http, https) } => {}
+            _ = async { tokio::join!(http, https, acme) } => {}
             () = shutdown => {}
         }
 

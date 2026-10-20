@@ -14,6 +14,8 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
 use super::*;
+use crate::acme::Storage;
+use crate::acme::tests::{Pebble, free_port};
 use crate::proxy::tests::{echo_upstream, upgrade_upstream};
 use crate::tls::tests::write_pair;
 
@@ -65,13 +67,18 @@ impl Running {
     }
 
     async fn start_with(dir: TempDir, text: &str) -> Self {
+        Self::start_with_connector(dir, text, Arc::new(instant_acme::Account::builder)).await
+    }
+
+    /// Like [`Running::start_with`], reaching the ACME server through `connector`.
+    async fn start_with_connector(dir: TempDir, text: &str, connector: acme::Connector) -> Self {
         for (name, body) in [("a", "site a"), ("b", "site b"), ("fallback", "fallback")] {
             fs::create_dir(dir.path().join(name)).unwrap();
             fs::write(dir.path().join(name).join("index.html"), body).unwrap();
         }
         let config = Config::parse(text, dir.path()).unwrap();
 
-        let server = Server::bind(&config).await.unwrap();
+        let server = Server::bind_with(&config, connector).await.unwrap();
         let (http, https) = (server.http_addr(), server.https_addr());
         let reloader = server.reloader();
         let challenges = server.challenges.clone();
@@ -514,6 +521,15 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAny {
 
 /// Connects like a CA checking TLS-ALPN-01: SNI `host`, offering only `acme-tls/1`.
 async fn acme_handshake(addr: SocketAddr, host: &str) -> io::Result<TlsStream<TcpStream>> {
+    connect_any(addr, host, ACME_TLS_ALPN).await
+}
+
+/// Connects with SNI `host`, offering `alpn` and accepting whatever cert the server sends.
+async fn connect_any(
+    addr: SocketAddr,
+    host: &str,
+    alpn: &[u8],
+) -> io::Result<TlsStream<TcpStream>> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -521,10 +537,111 @@ async fn acme_handshake(addr: SocketAddr, host: &str) -> io::Result<TlsStream<Tc
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AcceptAny))
         .with_no_client_auth();
-    config.alpn_protocols = vec![ACME_TLS_ALPN.to_vec()];
+    config.alpn_protocols = vec![alpn.to_vec()];
     let tcp = TcpStream::connect(addr).await.unwrap();
     let name = ServerName::try_from(host.to_owned()).unwrap();
     TlsConnector::from(Arc::new(config)).connect(name, tcp).await
+}
+
+/// The leaf cert the server presents for `host`, and the body of `GET /` over that connection.
+async fn served(addr: SocketAddr, host: &str) -> (CertificateDer<'static>, Bytes) {
+    let stream = connect_any(addr, host, b"h2").await.unwrap();
+    let leaf = stream.get_ref().1.peer_certificates().unwrap()[0].clone();
+    (leaf, get_tls(stream, host).await.1)
+}
+
+#[tokio::test]
+async fn serves_saved_acme_certs_at_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    // Nothing listens here, so the cert below can only come from storage.
+    let directory = "https://127.0.0.1:1/dir";
+    let names = vec!["a.test".to_owned()];
+    let saved = rcgen::generate_simple_self_signed(names.clone()).unwrap();
+    let storage = Storage::new(&dir.path().join("state"), directory);
+    storage.save_cert(&names, &saved.signing_key.serialize_pem(), &saved.cert.pem()).unwrap();
+
+    let text = format!(
+        "[server]\nhttps = \"127.0.0.1:0\"\n[[site]]\nhosts = [\"a.test\"]\nroot = \"a\"\n\
+         [acme]\ndirectory = \"{directory}\"\nstorage = \"state\"\n"
+    );
+    let server = Running::start_with(dir, &text).await;
+    let (leaf, body) = served(server.https.unwrap(), "a.test").await;
+    assert_eq!(&leaf, saved.cert.der());
+    assert_eq!(body, "site a");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn reload_rejects_acme_changes() {
+    let server = Running::start_tls_with(true, "[acme]\n").await;
+    let changed = format!("{}email = \"me@example.com\"\n", server.config);
+    let removed = server.config.replace("[acme]\n", "");
+    for config in [changed, removed] {
+        let err = server.reload(&config).unwrap_err().to_string();
+        assert_eq!(err, "[acme] settings changed; restart to apply them");
+    }
+    server.stop().await;
+}
+
+/// Waits until the manager has saved a cert covering `names`.
+async fn wait_for_cert(storage: &Storage, names: &[&str], pebble: &Pebble) -> acme::Issued {
+    let names: Vec<_> = names.iter().map(|name| name.to_string()).collect();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(issued) = storage.load_cert(&names).unwrap() {
+            return issued;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("no certificate for {names:?}:\n{}", pebble.logs());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A server whose `a.test` site gets its cert from Pebble, which really connects back:
+/// over HTTP-01 if `with_http`, otherwise TLS-ALPN-01.
+async fn start_with_pebble(with_http: bool) -> (Running, Pebble, Storage) {
+    let (http, https) = (free_port(), free_port());
+    let pebble = Pebble::start_validating(http, https);
+    let http = if with_http { format!("http = \"127.0.0.1:{http}\"\n") } else { String::new() };
+    let text = format!(
+        "[server]\n{http}https = \"127.0.0.1:{https}\"\n\
+         [[site]]\nhosts = [\"a.test\", \"www.a.test\"]\nroot = \"a\"\ndefault = true\n\
+         [acme]\ndirectory = \"{}\"\nstorage = \"state\"\n",
+        pebble.url()
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(&dir.path().join("state"), pebble.url());
+    let server = Running::start_with_connector(dir, &text, pebble.connector()).await;
+    (server, pebble, storage)
+}
+
+#[tokio::test]
+#[ignore = "needs pebble on PATH"]
+async fn issues_certs_over_http01_and_reissues_for_new_names() {
+    let (server, pebble, storage) = start_with_pebble(true).await;
+    let issued = wait_for_cert(&storage, &["a.test", "www.a.test"], &pebble).await;
+    let addr = server.https.unwrap();
+    for host in ["a.test", "www.a.test", "unknown.test"] {
+        assert_eq!(served(addr, host).await, (issued.certified.cert[0].clone(), "site a".into()));
+    }
+
+    let more_names = server.config.replace("\"www.a.test\"", "\"www.a.test\", \"new.a.test\"");
+    server.reload(&more_names).unwrap();
+    let reissued = wait_for_cert(&storage, &["a.test", "www.a.test", "new.a.test"], &pebble).await;
+    let (leaf, _) = served(addr, "new.a.test").await;
+    assert_eq!(leaf, reissued.certified.cert[0]);
+    server.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs pebble on PATH"]
+async fn issues_certs_over_tls_alpn01_without_http() {
+    let (server, pebble, storage) = start_with_pebble(false).await;
+    let issued = wait_for_cert(&storage, &["a.test", "www.a.test"], &pebble).await;
+    let (leaf, body) = served(server.https.unwrap(), "www.a.test").await;
+    assert_eq!((leaf, body), (issued.certified.cert[0].clone(), "site a".into()));
+    server.stop().await;
 }
 
 #[tokio::test]
