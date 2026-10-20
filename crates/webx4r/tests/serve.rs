@@ -47,8 +47,13 @@ fn listening_addr(stderr: &mut BufReader<ChildStderr>, scheme: &str) -> (String,
 }
 
 fn get(addr: &str) -> String {
+    get_path(addr, "/")
+}
+
+fn get_path(addr: &str, path: &str) -> String {
     let mut stream = TcpStream::connect(addr).unwrap();
-    stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).unwrap();
     let mut response = String::new();
     stream.read_to_string(&mut response).unwrap();
     response
@@ -63,6 +68,45 @@ fn serves_the_configured_site() {
     child.wait().unwrap();
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
     assert!(response.ends_with("hello from webx4r"), "{response}");
+}
+
+/// Starts an upstream that answers one request with the request line it received.
+fn upstream() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut lines = BufReader::new(&stream).lines().map(Result::unwrap);
+        let request_line = lines.next().unwrap();
+        lines.take_while(|line| !line.is_empty()).for_each(drop);
+        let body = format!("upstream saw {request_line}");
+        let len = body.len();
+        write!(
+            &stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}"
+        )
+        .unwrap();
+    });
+    addr
+}
+
+#[test]
+fn proxies_a_path_and_serves_the_rest() {
+    let (_dir, config) = site();
+    let text = format!(
+        "[server]\nhttp = \"127.0.0.1:0\"\n[[site]]\nroot = \"www\"\ndefault = true\n\
+         [[site.proxy]]\npath = \"/app\"\nupstreams = [\"{}\"]\nstrip_prefix = true\n",
+        upstream()
+    );
+    fs::write(&config, text).unwrap();
+    let (mut child, mut stderr) = serve(&config);
+    let addr = listening_addr(&mut stderr, "http").0;
+    let proxied = get_path(&addr, "/app/hello?x=1");
+    let static_page = get(&addr);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(proxied.ends_with("upstream saw GET /hello?x=1 HTTP/1.1"), "{proxied}");
+    assert!(static_page.ends_with("hello from webx4r"), "{static_page}");
 }
 
 #[test]
