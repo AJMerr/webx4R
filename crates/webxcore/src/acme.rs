@@ -30,7 +30,7 @@ use crate::tls;
 /// The ALPN protocol of TLS-ALPN-01 challenges (RFC 8737).
 pub const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
 
-const HTTP_CHALLENGE_PATH: &str = "/.well-known/acme-challenge/";
+pub(crate) const HTTP_CHALLENGE_PATH: &str = "/.well-known/acme-challenge/";
 
 /// Answers to pending challenges, which prove to the CA that we control a hostname.
 #[derive(Debug, Default)]

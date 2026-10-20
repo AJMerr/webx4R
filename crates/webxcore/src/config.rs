@@ -76,6 +76,14 @@ pub struct Site {
     pub cert: Option<PathBuf>,
     /// PEM private key for `cert`.
     pub key: Option<PathBuf>,
+    /// Redirect plain HTTP requests to HTTPS for the hosts that have a cert; see
+    /// [`Site::tls_hosts`]. ACME challenges are never redirected.
+    #[serde(default = "yes")]
+    pub redirect_https: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -123,6 +131,14 @@ impl Site {
     pub fn acme_hosts(&self) -> impl Iterator<Item = &String> {
         let hosts: &[String] = if self.cert.is_some() { &[] } else { &self.hosts };
         hosts.iter().filter(|host| !is_localhost(host) && host.parse::<IpAddr>().is_err())
+    }
+
+    /// The hosts HTTPS has a cert for: all of them with cert files; otherwise localhost
+    /// names, and when `acme` is on, the names in [`Site::acme_hosts`].
+    pub fn tls_hosts(&self, acme: bool) -> impl Iterator<Item = &String> {
+        self.hosts.iter().filter(move |host| {
+            self.cert.is_some() || is_localhost(host) || (acme && host.parse::<IpAddr>().is_err())
+        })
     }
 
     pub fn policy(&self) -> PathPolicy {
@@ -570,6 +586,22 @@ mod tests {
         }
         let config = parse(&(with_tls(HTTPS, "") + ACME)).unwrap();
         assert!(config.sites[0].has_tls(true), "ACME covers example.com");
+    }
+
+    #[test]
+    fn tls_hosts_and_redirects() {
+        let hosts = "\"example.com\", \"localhost\", \"127.0.0.1\"";
+        let text = with_tls(HTTPS, "").replace("\"example.com\"", hosts);
+        let config = parse(&text).unwrap();
+        let site = &config.sites[0];
+        assert!(site.redirect_https, "on by default");
+        assert_eq!(site.tls_hosts(false).collect::<Vec<_>>(), ["localhost"]);
+        assert_eq!(site.tls_hosts(true).collect::<Vec<_>>(), ["example.com", "localhost"]);
+
+        let config = parse(&(text.clone() + CERT + "\nredirect_https = false")).unwrap();
+        let site = &config.sites[0];
+        assert!(!site.redirect_https);
+        assert_eq!(site.tls_hosts(false).count(), 3, "cert files cover every host");
     }
 
     const ACME: &str = "\n[acme]\n";

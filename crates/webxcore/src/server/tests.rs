@@ -402,7 +402,8 @@ async fn bad_certificate_fails_the_whole_reload() {
     let swapped_roots = server.config.replace("root = \"a\"", "root = \"b\"");
     let err = server.reload(&swapped_roots).unwrap_err();
     assert!(err.to_string().ends_with("no certificates found"), "{err}");
-    assert!(server.get("a.test").await.ends_with("site a"), "sites weren't swapped either");
+    let (_, body) = get_tls(server.tls("a.test", b"h2").await, "a.test").await;
+    assert_eq!(body, "site a", "sites weren't swapped either");
     server.stop().await;
 }
 
@@ -442,12 +443,40 @@ async fn serves_https_by_sni_and_alpn() {
 }
 
 #[tokio::test]
-async fn serves_http_and_https_together() {
+async fn redirects_http_to_https_for_hosts_with_a_cert() {
     let server = Running::start_tls(true).await;
-    assert!(server.get("a.test").await.ends_with("site a"));
+    let port = server.https.unwrap().port();
+    let res = server.get_path("a.test", "/x/y?q=1").await;
+    assert!(res.starts_with("HTTP/1.1 308"), "{res}");
+    assert!(res.contains(&format!("\r\nlocation: https://a.test:{port}/x/y?q=1\r\n")), "{res}");
+    let challenge = server.get_path("a.test", "/.well-known/acme-challenge/tok").await;
+    assert!(challenge.starts_with("HTTP/1.1 404"), "ACME challenges stay on HTTP: {challenge}");
+
     let (_, body) = get_tls(server.tls("b.test", b"h2").await, "b.test").await;
     assert_eq!(body, "site b");
     server.stop().await;
+}
+
+#[tokio::test]
+async fn no_redirect_when_opted_out_or_without_a_cert() {
+    let sites = "[[site]]\nhosts = [\"c.test\"]\nroot = \"b\"\n\
+                 cert = \"a.test.crt\"\nkey = \"a.test.key\"\nredirect_https = false\n\
+                 [[site]]\nroot = \"fallback\"\ndefault = true\n";
+    let server = Running::start_tls_with(true, sites).await;
+    assert!(server.get("c.test").await.ends_with("site b"), "opted out");
+    assert!(server.get("unknown.test").await.ends_with("fallback"), "no cert for this name");
+    server.stop().await;
+}
+
+#[test]
+fn redirect_location_omits_the_default_port() {
+    let location = |port, uri: &str| {
+        let res = redirect_to_https("a.test", port, &uri.parse().unwrap());
+        res.headers()[LOCATION].to_str().unwrap().to_owned()
+    };
+    assert_eq!(location(443, "/a?b=c"), "https://a.test/a?b=c");
+    assert_eq!(location(8443, "/a?b=c"), "https://a.test:8443/a?b=c");
+    assert_eq!(location(443, "http://a.test"), "https://a.test/", "absolute form, no path");
 }
 
 #[tokio::test]
