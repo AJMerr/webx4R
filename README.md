@@ -17,8 +17,10 @@ Early development; there are no releases yet. What works now:
 - Built-in error pages that a site can replace with its own
 - Config reload without downtime, with `webx4r reload` or SIGHUP on Unix
 - Graceful shutdown on Ctrl-C, or SIGTERM on Unix
+- Access logs in JSON or nginx's combined format, and server logs, written to daily files
+- Prometheus metrics for responses, connections, TLS, upstreams, certificates and reloads
 
-Access logs and metrics are not built yet. They make up the rest of the first milestone.
+Benchmarks against nginx are the rest of the first milestone.
 
 Linux is the main target. Windows is supported and tested in CI.
 
@@ -59,7 +61,7 @@ Start the server and open http://localhost:8080:
 ./target/release/webx4r serve --config mysite/webx4r.toml
 ```
 
-Logs go to stderr at the `info` level. Set `WEBX4R_LOG=debug` for more detail.
+Logs go to stderr at the `info` level. Set `WEBX4R_LOG=debug` for more detail, or see [Logs](#logs) to write them to files.
 
 ## Configuration
 
@@ -165,9 +167,60 @@ Edit the config, then apply it without a restart:
 
 On Unix, `kill -HUP <pid>` (or systemd's `ExecReload`) does the same. The new config is checked first. If anything is wrong, the error is printed and the server keeps its current config. Requests already in progress finish on the old config; every new request uses the new one, including on keep-alive connections that are already open.
 
-Sites, proxy routes and certificates all reload, so renewed certificate files take effect too, and new hostnames get ACME certificates. Changes to `[server]` and `[acme]` need a restart.
+Sites, proxy routes and certificates all reload, so renewed certificate files take effect too, and new hostnames get ACME certificates. Changes to `[server]`, `[acme]`, `[log]` and `[metrics]` need a restart.
 
 `webx4r reload` reaches the server through a control socket that only its owner can use. On Unix it's `$XDG_RUNTIME_DIR/webx4r-<id>.sock`, named after the config's folder, or `webx4r.sock` next to the config when that variable isn't set. On Windows it's a named pipe. The server logs the location at startup. Set `[server] control` to choose it yourself.
+
+### Logs
+
+Without a `[log]` table, the server log goes to stderr and there's no access log. Add one to write both to files:
+
+```toml
+[log]
+dir = "logs"
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `dir` | required | Folder for the log files, resolved like `root`. It's created if missing. |
+| `keep_days` | `14` | Days of each log to keep, today's included. Older files are deleted. |
+| `access_format` | `"json"` | `"json"`, or `"combined"` for nginx's combined format. |
+
+Each log starts a new file at midnight UTC: `server.<date>.log` and `access.<date>.log`. The server log is JSON, one object per line; set `WEBX4R_LOG` to change its level. At startup, stderr gets one line saying where the logs went. If the folder can't be written, the server doesn't start.
+
+An access log entry is written when its response has been sent, so it records the bytes actually sent and the full time taken. JSON entries look like this, on one line:
+
+```json
+{"time":"2026-10-20T14:03:07.218Z","client":"203.0.113.7","host":"example.com","method":"GET","uri":"/api/users?page=2","protocol":"HTTP/2.0","status":200,"bytes":1234,"duration":0.0042,"referer":null,"user_agent":"curl/8.10.1","upstream":"127.0.0.1:3000"}
+```
+
+`duration` is in seconds, from the request's arrival to the response's last byte. `upstream` names the app that answered, or is `null` for static files.
+
+### Metrics
+
+Add a `[metrics]` table to serve Prometheus metrics at `/metrics` on an address of their own:
+
+```toml
+[metrics]
+listen = "127.0.0.1:9100"
+```
+
+The endpoint has no authentication or TLS, so keep it on loopback or a private network. It's separate from the sites, so they never expose it, and scrapes aren't counted or logged. Metrics are in the OpenMetrics format and count from when the server starts; reloads don't reset them.
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `webx4r_http_responses_total` | `site`, `code` | Responses by status class: `2xx`, `4xx` and so on. |
+| `webx4r_http_response_duration_seconds` | `site` | Histogram of the time from a request's arrival to its response's last byte. |
+| `webx4r_http_response_body_bytes_total` | `site` | Response body bytes sent. |
+| `webx4r_connections_total` | `listener` | Client connections accepted on `http` or `https`. |
+| `webx4r_connections_open` | `listener` | Client connections open now. |
+| `webx4r_tls_handshake_failures_total` | `reason` | Failed TLS handshakes: `error`, or `timeout` after 10 seconds. |
+| `webx4r_proxy_upstream_failures_total` | `upstream`, `kind` | Failed exchanges with an app: `connect`, `timeout` waiting for its response, or `error` after the request was sent. |
+| `webx4r_acme_certificate_expiry_timestamp_seconds` | `name` | When each ACME certificate expires, as a Unix time. |
+| `webx4r_acme_order_failures_total` | `name` | Failed attempts to get an ACME certificate. |
+| `webx4r_config_reloads_total` | `result` | Reloads, `ok` or `error`. |
+
+`site` is the site's first hostname, `default` for a default site with no `hosts`, or `none` for responses that reached no site, such as `421 Misdirected Request`. `name` is a certificate's first hostname.
 
 ## Development
 
@@ -184,7 +237,7 @@ The ACME tests need [Pebble](https://github.com/letsencrypt/pebble), Let's Encry
 | Crate | Contents |
 |---|---|
 | `crates/webxlib` | HTTP building blocks: static files, MIME types, pages, response bodies |
-| `crates/webxcore` | The server: config, listeners, TLS, ACME, routing, reverse proxy |
+| `crates/webxcore` | The server: config, listeners, TLS, ACME, routing, reverse proxy, access logs, metrics |
 | `crates/webx4r` | The `webx4r` command |
 
 ## History

@@ -130,7 +130,6 @@ fn serves_https_only_with_a_self_signed_localhost_cert() {
 }
 
 /// Reads log lines until one contains `needle`, and returns it.
-#[cfg(unix)]
 fn wait_for_log(stderr: &mut BufReader<ChildStderr>, needle: &str) -> String {
     for line in stderr.lines() {
         let line = line.unwrap();
@@ -230,6 +229,37 @@ fn writes_server_and_access_logs_to_files() {
     assert!(access.contains("] \"GET / HTTP/1.1\" 200 17 \"-\" \"-\"\n"), "{access}");
     assert!(server.contains(&format!("listening on http://{addr}")), "{server}");
     assert!(server.lines().all(|line| line.starts_with("{\"timestamp\":")), "JSON lines: {server}");
+}
+
+#[test]
+fn serves_metrics_on_their_own_address() {
+    let (_dir, config) = site();
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(&config, text + "[metrics]\nlisten = \"127.0.0.1:0\"\n").unwrap();
+    let (mut child, mut stderr) = serve(&config);
+    let addr = listening_addr(&mut stderr, "http").0;
+    let marker = "serving metrics at http://";
+    let line = wait_for_log(&mut stderr, marker);
+    let metrics = line.split(marker).nth(1).unwrap().trim().trim_end_matches("/metrics");
+    let page = get(&addr);
+
+    // A response is counted once its body is dropped, which can come just after the client
+    // has it all.
+    let counted = "\nwebx4r_http_responses_total{site=\"default\",code=\"2xx\"} 1\n";
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let scrape = loop {
+        let scrape = get_path(metrics, "/metrics");
+        if scrape.contains(counted) || std::time::Instant::now() > deadline {
+            break scrape;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    assert!(page.ends_with("hello from webx4r"), "{page}");
+    assert!(scrape.starts_with("HTTP/1.1 200 OK"), "{scrape}");
+    assert!(scrape.contains(counted) && scrape.ends_with("# EOF\n"), "{scrape}");
 }
 
 #[test]
