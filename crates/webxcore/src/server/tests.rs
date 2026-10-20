@@ -354,6 +354,42 @@ async fn metrics_count_responses_per_site_across_reloads() {
 }
 
 #[tokio::test]
+async fn metrics_count_connections_failures_and_reloads() {
+    let unreachable = closed_port().await;
+    // The proxy joins the last site, b.test.
+    let extra = format!(
+        "[[site.proxy]]\npath = \"/\"\nupstreams = [\"{unreachable}\"]\n\
+         [metrics]\nlisten = \"127.0.0.1:0\"\n"
+    );
+    let server = Running::start_tls_with(true, &extra).await;
+    let mut plain = TcpStream::connect(server.https.unwrap()).await.unwrap();
+    plain.write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await.unwrap();
+    // The server drops the connection; a reset instead of a clean close is fine.
+    let _ = plain.read_to_end(&mut Vec::new()).await;
+    let (_, body) = get_tls(server.tls("b.test", b"h2").await, "b.test").await;
+    assert!(String::from_utf8_lossy(&body).contains("502"), "{body:?}");
+    assert!(server.get("a.test").await.starts_with("HTTP/1.1 308"));
+    server.reload(&server.config).unwrap();
+    server.reload(&server.config.replace("root = \"a\"", "root = \"missing\"")).unwrap_err();
+
+    let upstream = format!(
+        "webx4r_proxy_upstream_failures_total{{upstream=\"{unreachable}\",kind=\"connect\"}} 1"
+    );
+    server
+        .wait_for_metrics(&[
+            "webx4r_connections_total{listener=\"http\"} 1",
+            "webx4r_connections_total{listener=\"https\"} 2",
+            "webx4r_connections_open{listener=\"http\"} 0",
+            "webx4r_tls_handshake_failures_total{reason=\"error\"} 1",
+            &upstream,
+            "webx4r_config_reloads_total{result=\"ok\"} 1",
+            "webx4r_config_reloads_total{result=\"error\"} 1",
+        ])
+        .await;
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn no_metrics_without_the_table() {
     let server = Running::start(false).await;
     assert!(server.metrics.is_none());
@@ -686,12 +722,18 @@ async fn serves_saved_acme_certs_at_startup() {
 
     let text = format!(
         "[server]\nhttps = \"127.0.0.1:0\"\n[[site]]\nhosts = [\"a.test\"]\nroot = \"a\"\n\
-         [acme]\ndirectory = \"{directory}\"\nstorage = \"state\"\n"
+         [acme]\ndirectory = \"{directory}\"\nstorage = \"state\"\n\
+         [metrics]\nlisten = \"127.0.0.1:0\"\n"
     );
     let server = Running::start_with(dir, &text).await;
     let (leaf, body) = served(server.https.unwrap(), "a.test").await;
     assert_eq!(&leaf, saved.cert.der());
     assert_eq!(body, "site a");
+    // rcgen's default expiry.
+    let expires = rcgen::date_time_ymd(4096, 1, 1).unix_timestamp();
+    let expiry =
+        format!("webx4r_acme_certificate_expiry_timestamp_seconds{{name=\"a.test\"}} {expires}");
+    server.wait_for_metrics(&[&expiry]).await;
     server.stop().await;
 }
 

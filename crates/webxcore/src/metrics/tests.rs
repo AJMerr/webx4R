@@ -27,6 +27,45 @@ fn sites_keep_their_counts_when_resolved_again() {
 }
 
 #[test]
+fn connections_upstreams_certificates_and_reloads() {
+    let metrics = Metrics::default();
+    let https = metrics.listener("https");
+    let open = https.accepted();
+    drop(https.accepted());
+    https.handshake_failed(true);
+    let upstream = metrics.upstream("127.0.0.1:3000");
+    upstream.failed(&ProxyError::Timeout);
+    upstream.failed(&ProxyError::BadRequest);
+    metrics.certificate_expires("a.test", UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+    metrics.certificate_expires("b.test", UNIX_EPOCH);
+    metrics.certificate_removed("b.test");
+    metrics.order_failed("a.test");
+    for ok in [true, false, false] {
+        metrics.reloaded(ok);
+    }
+
+    let text = metrics.encode();
+    assert_has(
+        &text,
+        &[
+            "webx4r_connections_total{listener=\"https\"} 2",
+            "webx4r_connections_open{listener=\"https\"} 1",
+            "webx4r_tls_handshake_failures_total{reason=\"timeout\"} 1",
+            "webx4r_tls_handshake_failures_total{reason=\"error\"} 0",
+            "webx4r_proxy_upstream_failures_total{upstream=\"127.0.0.1:3000\",kind=\"timeout\"} 1",
+            "webx4r_proxy_upstream_failures_total{upstream=\"127.0.0.1:3000\",kind=\"connect\"} 0",
+            "webx4r_acme_certificate_expiry_timestamp_seconds{name=\"a.test\"} 1800000000",
+            "webx4r_acme_order_failures_total{name=\"a.test\"} 1",
+            "webx4r_config_reloads_total{result=\"ok\"} 1",
+            "webx4r_config_reloads_total{result=\"error\"} 2",
+        ],
+    );
+    assert!(!text.contains("name=\"b.test\""), "removed certificates lose their series");
+    drop(open);
+    assert_has(&metrics.encode(), &["webx4r_connections_open{listener=\"https\"} 0"]);
+}
+
+#[test]
 fn every_status_class_has_a_series() {
     let metrics = Metrics::default();
     let site = metrics.site("a.test");

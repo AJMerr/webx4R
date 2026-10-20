@@ -164,6 +164,7 @@ pub struct Issued {
     pub names: Vec<String>,
     /// When a third of its lifetime is left, as Let's Encrypt recommends.
     pub renew_at: SystemTime,
+    pub expires_at: SystemTime,
 }
 
 impl Issued {
@@ -189,13 +190,13 @@ impl Issued {
         };
         let validity = x509.validity();
         let (start, end) = (validity.not_before.timestamp(), validity.not_after.timestamp());
-        let renew_at = end - (end - start) / 3;
-        let renew_at = UNIX_EPOCH + Duration::from_secs(u64::try_from(renew_at).unwrap_or(0));
+        let at = |secs: i64| UNIX_EPOCH + Duration::from_secs(u64::try_from(secs).unwrap_or(0));
+        let (renew_at, expires_at) = (at(end - (end - start) / 3), at(end));
 
         let key = PrivateKeyDer::from_pem_slice(pem).map_err(|e| invalid(&e))?;
         let certified =
             CertifiedKey::from_der(chain, key, &tls::provider()).map_err(|e| invalid(&e))?;
-        Ok(Self { certified: Arc::new(certified), names, renew_at })
+        Ok(Self { certified: Arc::new(certified), names, renew_at, expires_at })
     }
 
     fn covers(&self, names: &[String]) -> bool {

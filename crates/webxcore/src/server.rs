@@ -166,7 +166,8 @@ impl Server {
         let router = Arc::new(ArcSwap::from_pointee(router));
         let manager = match (&challenges, &certs) {
             (Some(challenges), Some(certs)) => {
-                acme::Manager::new(config, Arc::clone(challenges), Arc::clone(certs))?
+                let (challenges, certs) = (Arc::clone(challenges), Arc::clone(certs));
+                acme::Manager::new(config, challenges, certs, registry.clone())?
             }
             _ => None,
         };
@@ -394,7 +395,8 @@ impl Router {
                 })?),
                 None => None,
             };
-            let mut routes: Vec<_> = site.proxies.iter().map(Route::new).collect();
+            let route = |proxy| Route::new(proxy, registry);
+            let mut routes: Vec<_> = site.proxies.iter().map(route).collect();
             routes.sort_by_key(|route| std::cmp::Reverse(route.prefix().len()));
             let redirect_hosts = match https_port {
                 Some(_) if site.redirect_https => site.tls_hosts(acme).cloned().collect(),
