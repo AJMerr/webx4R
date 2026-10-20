@@ -183,8 +183,13 @@ impl Connection {
 
 /// Picks the site for each request.
 struct Router {
-    sites: HashMap<String, StaticFiles>,
-    default: Option<StaticFiles>,
+    sites: HashMap<String, Arc<SiteHandler>>,
+    default: Option<Arc<SiteHandler>>,
+}
+
+/// Serves one site's requests.
+struct SiteHandler {
+    files: Option<StaticFiles>,
 }
 
 impl Router {
@@ -192,15 +197,19 @@ impl Router {
         let mut sites = HashMap::new();
         let mut default = None;
         for (i, site) in config.sites.iter().enumerate() {
-            let files = StaticFiles::new(&site.root, site.policy()).map_err(|e| {
-                let root = site.root.display();
-                io::Error::new(e.kind(), format!("site {}: can't open root {root}: {e}", i + 1))
-            })?;
+            let files = match &site.root {
+                Some(root) => Some(StaticFiles::new(root, site.policy()).map_err(|e| {
+                    let root = root.display();
+                    io::Error::new(e.kind(), format!("site {}: can't open root {root}: {e}", i + 1))
+                })?),
+                None => None,
+            };
+            let handler = Arc::new(SiteHandler { files });
             for host in &site.hosts {
-                sites.insert(host.clone(), files.clone());
+                sites.insert(host.clone(), Arc::clone(&handler));
             }
             if site.default {
-                default = Some(files);
+                default = Some(handler);
             }
         }
         Ok(Self { sites, default })
@@ -213,8 +222,17 @@ impl Router {
         };
         let site = host.and_then(|host| self.sites.get(&host)).or(self.default.as_ref());
         match site {
-            Some(site) => site.serve(&req).await,
+            Some(site) => site.handle(&req).await,
             None => pages::error_response(StatusCode::MISDIRECTED_REQUEST),
+        }
+    }
+}
+
+impl SiteHandler {
+    async fn handle<B>(&self, req: &Request<B>) -> Response<Body> {
+        match &self.files {
+            Some(files) => files.serve(req).await,
+            None => pages::error_response(StatusCode::NOT_FOUND),
         }
     }
 }

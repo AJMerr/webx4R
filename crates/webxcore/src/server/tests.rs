@@ -192,6 +192,16 @@ async fn serves_http2_by_authority() {
 }
 
 #[tokio::test]
+async fn site_without_root_has_no_static_files() {
+    let text = "[server]\nhttp = \"127.0.0.1:0\"\n[[site]]\nhosts = [\"c.test\"]\n\
+                [[site.proxy]]\npath = \"/api\"\nupstreams = [\"127.0.0.1:9\"]\n";
+    let server = Running::start_with(tempfile::tempdir().unwrap(), text).await;
+    let response = server.get("c.test").await;
+    assert!(response.starts_with("HTTP/1.1 404 Not Found"), "{response}");
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn missing_root_fails_at_bind() {
     let dir = tempfile::tempdir().unwrap();
     let text =
