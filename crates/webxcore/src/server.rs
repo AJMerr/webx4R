@@ -3,7 +3,7 @@
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
@@ -12,9 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use http::header::HOST;
-use http::uri::Authority;
-use http::{Method, Request, Response, StatusCode, Version};
+use http::header::{HOST, LOCATION};
+use http::uri::{Authority, PathAndQuery};
+use http::{Method, Request, Response, StatusCode, Uri, Version};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
@@ -27,6 +27,7 @@ use webxlib::body::Body;
 use webxlib::pages;
 use webxlib::static_files::StaticFiles;
 
+use crate::acme::{self, ACME_TLS_ALPN, Challenges};
 use crate::config::{self, Config};
 use crate::proxy::{self, Peer, Route};
 use crate::tls::CertStore;
@@ -46,6 +47,9 @@ pub struct Server {
     http: Option<Listener>,
     https: Option<Listener>,
     reloader: Reloader,
+    /// Present with `[acme]`, like `manager`.
+    challenges: Option<Arc<Challenges>>,
+    manager: Option<acme::Manager>,
 }
 
 /// Applies a new config to a running [`Server`].
@@ -57,19 +61,30 @@ pub struct Reloader {
     client: proxy::Client,
     /// Present when serving HTTPS.
     certs: Option<Arc<CertStore>>,
-    /// The `[server]` table, which only a restart can change.
+    /// The `[server]` and `[acme]` tables, which only a restart can change.
     server: config::Server,
+    acme: Option<config::Acme>,
+    /// Tells the ACME manager which names the new config needs certs for.
+    manager: Option<acme::Handle>,
+    /// The bound HTTPS port, for redirects.
+    https_port: Option<u16>,
 }
 
 impl Reloader {
     /// Builds the new config's sites and certificates, then swaps them in;
     /// on error, the old config stays.
     pub fn reload(&self, config: &Config) -> io::Result<()> {
+        let restart = |table| {
+            let msg = format!("{table} settings changed; restart to apply them");
+            Err(io::Error::new(io::ErrorKind::InvalidInput, msg))
+        };
         if config.server != self.server {
-            let msg = "[server] settings changed; restart to apply them";
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, msg));
+            return restart("[server]");
         }
-        let router = Router::new(config, self.client.clone())?;
+        if config.acme != self.acme {
+            return restart("[acme]");
+        }
+        let router = Router::new(config, self.client.clone(), self.https_port)?;
         let certs = match &self.certs {
             Some(store) => Some((store, store.load(config)?)),
             None => None,
@@ -77,6 +92,9 @@ impl Reloader {
         self.router.store(Arc::new(router));
         if let Some((store, certs)) = certs {
             store.store(certs);
+        }
+        if let Some(manager) = &self.manager {
+            manager.update(config);
         }
         Ok(())
     }
@@ -99,30 +117,46 @@ impl Listener {
 }
 
 impl Server {
-    /// Opens every site root and loads every cert, then binds the listeners.
+    /// Loads every cert, binds the listeners, then opens every site root.
     pub async fn bind(config: &Config) -> io::Result<Self> {
-        let client = proxy::Client::default();
-        let router = Arc::new(ArcSwap::from_pointee(Router::new(config, client.clone())?));
+        let challenges = config.acme.as_ref().map(|_| Arc::new(Challenges::default()));
         let certs = match config.server.https {
-            Some(_) => Some(Arc::new(CertStore::new(config)?)),
+            Some(_) => Some(Arc::new(CertStore::new(config, challenges.clone())?)),
             None => None,
         };
-        let https = match (config.server.https, &certs) {
-            (Some(addr), Some(certs)) => {
-                Some((addr, TlsAcceptor::from(Arc::new(certs.server_config()))))
-            }
-            _ => None,
-        };
-        let reloader = Reloader { router, client, certs, server: config.server.clone() };
         let http = match config.server.http {
             Some(addr) => Some(Listener::bind(addr, None).await?),
             None => None,
         };
-        let https = match https {
-            Some((addr, acceptor)) => Some(Listener::bind(addr, Some(acceptor)).await?),
-            None => None,
+        let https = match (config.server.https, &certs) {
+            (Some(addr), Some(certs)) => {
+                let acceptor = TlsAcceptor::from(Arc::new(certs.server_config()));
+                Some(Listener::bind(addr, Some(acceptor)).await?)
+            }
+            _ => None,
         };
-        Ok(Self { http, https, reloader })
+        // After binding, so redirects name the port actually bound.
+        let https_port = https.as_ref().map(|listener| listener.addr.port());
+        let client = proxy::Client::default();
+        let router = Router::new(config, client.clone(), https_port)?;
+        let router = Arc::new(ArcSwap::from_pointee(router));
+        let manager = match (&challenges, &certs) {
+            (Some(challenges), Some(certs)) => {
+                acme::Manager::new(config, Arc::clone(challenges), Arc::clone(certs))?
+            }
+            _ => None,
+        };
+        let (manager, handle) = manager.unzip();
+        let reloader = Reloader {
+            router,
+            client,
+            certs,
+            server: config.server.clone(),
+            acme: config.acme.clone(),
+            manager: handle,
+            https_port,
+        };
+        Ok(Self { http, https, reloader, challenges, manager })
     }
 
     /// A handle for reloading the config while [`Server::run`] serves.
@@ -138,18 +172,26 @@ impl Server {
         self.https.as_ref().map(|listener| listener.addr)
     }
 
-    /// Serves until `shutdown` resolves, then lets in-flight requests finish.
-    pub async fn run(self, shutdown: impl Future<Output = ()>) {
+    /// Serves, and keeps ACME certs issued, until `shutdown` resolves; then lets in-flight
+    /// requests finish.
+    pub async fn run(mut self, shutdown: impl Future<Output = ()>) {
         let mut builder = auto::Builder::new(TokioExecutor::new());
         // Enables hyper's header-read timeout, which guards against slow-header attacks.
         builder.http1().timer(TokioTimer::new());
         let builder = Arc::new(builder);
         let graceful = GracefulShutdown::new();
 
+        let manager = self.manager.take();
+        let acme = async {
+            match manager {
+                Some(manager) => manager.run().await,
+                None => std::future::pending().await,
+            }
+        };
         let http = self.accept(self.http.as_ref(), &builder, &graceful);
         let https = self.accept(self.https.as_ref(), &builder, &graceful);
         tokio::select! {
-            _ = async { tokio::join!(http, https) } => {}
+            _ = async { tokio::join!(http, https, acme) } => {}
             () = shutdown => {}
         }
 
@@ -186,6 +228,7 @@ impl Server {
             let conn = Connection {
                 peer: Peer { addr: peer, https: listener.tls.is_some() },
                 router: Arc::clone(&self.reloader.router),
+                challenges: self.challenges.clone(),
                 builder: Arc::clone(builder),
                 watcher: graceful.watcher(),
             };
@@ -195,6 +238,12 @@ impl Server {
                 Some(acceptor) => tokio::spawn(async move {
                     let handshake = acceptor.accept(stream);
                     match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, handshake).await {
+                        // The handshake is the whole TLS-ALPN-01 answer (RFC 8737 §3).
+                        Ok(Ok(stream))
+                            if stream.get_ref().1.alpn_protocol() == Some(ACME_TLS_ALPN) =>
+                        {
+                            tracing::debug!(%peer, "answered a TLS-ALPN-01 challenge");
+                        }
                         Ok(Ok(stream)) => conn.serve(stream).await,
                         Ok(Err(e)) => tracing::debug!(%peer, error = %e, "TLS handshake failed"),
                         Err(_) => tracing::debug!(%peer, "TLS handshake timed out"),
@@ -209,6 +258,7 @@ impl Server {
 struct Connection {
     peer: Peer,
     router: Arc<ArcSwap<Router>>,
+    challenges: Option<Arc<Challenges>>,
     builder: Arc<ConnBuilder>,
     /// Held from accept, so shutdown also waits for handshakes in progress.
     watcher: Watcher,
@@ -219,10 +269,16 @@ impl Connection {
     where
         I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let Self { peer, router, builder, watcher } = self;
+        let Self { peer, router, challenges, builder, watcher } = self;
         let service = service_fn(move |req| {
+            let answer = challenges.as_ref().and_then(|challenges| challenges.http_response(&req));
             let router = router.load_full();
-            async move { Ok::<_, Infallible>(router.handle(req, peer).await) }
+            async move {
+                Ok::<_, Infallible>(match answer {
+                    Some(res) => res,
+                    None => router.handle(req, peer).await,
+                })
+            }
         });
         let conn = builder.serve_connection_with_upgrades(TokioIo::new(io), service);
         if let Err(e) = watcher.watch(conn.into_owned()).await {
@@ -237,6 +293,8 @@ struct Router {
     default: Option<Arc<SiteHandler>>,
     /// Shared by every site, so they all draw on one pool of upstream connections.
     client: proxy::Client,
+    /// The HTTPS port that plain HTTP requests are redirected to, when there is one.
+    https_port: Option<u16>,
 }
 
 /// Serves one site's requests.
@@ -244,12 +302,15 @@ struct SiteHandler {
     files: Option<StaticFiles>,
     /// Longest prefix first, so the most specific route wins.
     routes: Vec<Route>,
+    /// Hosts whose plain HTTP requests are redirected to HTTPS.
+    redirect_hosts: HashSet<String>,
 }
 
 impl Router {
-    fn new(config: &Config, client: proxy::Client) -> io::Result<Self> {
+    fn new(config: &Config, client: proxy::Client, https_port: Option<u16>) -> io::Result<Self> {
         let mut sites = HashMap::new();
         let mut default = None;
+        let acme = config.acme.is_some();
         for (i, site) in config.sites.iter().enumerate() {
             let files = match &site.root {
                 Some(root) => Some(StaticFiles::new(root, site.policy()).map_err(|e| {
@@ -260,7 +321,11 @@ impl Router {
             };
             let mut routes: Vec<_> = site.proxies.iter().map(Route::new).collect();
             routes.sort_by_key(|route| std::cmp::Reverse(route.prefix().len()));
-            let handler = Arc::new(SiteHandler { files, routes });
+            let redirect_hosts = match https_port {
+                Some(_) if site.redirect_https => site.tls_hosts(acme).cloned().collect(),
+                _ => HashSet::new(),
+            };
+            let handler = Arc::new(SiteHandler { files, routes, redirect_hosts });
             for host in &site.hosts {
                 sites.insert(host.clone(), Arc::clone(&handler));
             }
@@ -268,7 +333,7 @@ impl Router {
                 default = Some(handler);
             }
         }
-        Ok(Self { sites, default, client })
+        Ok(Self { sites, default, client, https_port })
     }
 
     async fn handle(&self, req: Request<Incoming>, peer: Peer) -> Response<Body> {
@@ -276,11 +341,19 @@ impl Router {
             Ok(host) => host,
             Err(code) => return pages::error_response(code),
         };
-        let site = host.and_then(|host| self.sites.get(&host)).or(self.default.as_ref());
-        match site {
-            Some(site) => site.handle(req, peer, &self.client).await,
-            None => pages::error_response(StatusCode::MISDIRECTED_REQUEST),
+        let site = host.as_ref().and_then(|host| self.sites.get(host)).or(self.default.as_ref());
+        let Some(site) = site else {
+            return pages::error_response(StatusCode::MISDIRECTED_REQUEST);
+        };
+        // Unknown hosts reach the default site but aren't in its `redirect_hosts`, since no
+        // cert covers them.
+        if let (false, Some(port), Some(host)) = (peer.https, self.https_port, &host)
+            && site.redirect_hosts.contains(host)
+            && !req.uri().path().starts_with(acme::HTTP_CHALLENGE_PATH)
+        {
+            return redirect_to_https(host, port, req.uri());
         }
+        site.handle(req, peer, &self.client).await
     }
 }
 
@@ -307,6 +380,17 @@ impl SiteHandler {
             },
         }
     }
+}
+
+/// A permanent redirect to the same URL over HTTPS on `port`; 308 keeps the method and body.
+fn redirect_to_https(host: &str, port: u16, uri: &Uri) -> Response<Body> {
+    let port = if port == 443 { String::new() } else { format!(":{port}") };
+    let path = uri.path_and_query().map_or("/", PathAndQuery::as_str);
+    Response::builder()
+        .status(StatusCode::PERMANENT_REDIRECT)
+        .header(LOCATION, format!("https://{host}{port}{path}"))
+        .body(Body::empty())
+        .expect("hostnames and URI paths are valid header values")
 }
 
 /// The request's hostname, lowercased, without port or trailing dot.

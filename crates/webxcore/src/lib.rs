@@ -1,5 +1,6 @@
 //! The webx4R server: config, listeners, TLS, reverse proxy, reload, metrics.
 
+pub mod acme;
 pub mod config;
 pub mod control;
 pub mod proxy;

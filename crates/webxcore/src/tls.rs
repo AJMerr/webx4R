@@ -1,5 +1,5 @@
-//! HTTPS certificates: loads each site's PEM files or self-signs localhost names,
-//! picks one per handshake by SNI, and swaps them on reload.
+//! HTTPS certificates: loads each site's PEM files, self-signs localhost names, or serves
+//! ACME certs; picks one per handshake by SNI, and swaps them on reload.
 
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -15,20 +15,32 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 
+use crate::acme::{ACME_TLS_ALPN, Challenges};
 use crate::config::{Config, is_localhost};
+
+/// The crypto backend for every certificate and handshake.
+pub(crate) fn provider() -> CryptoProvider {
+    rustls::crypto::aws_lc_rs::default_provider()
+}
 
 /// The live certificates, which rustls asks for on every handshake.
 #[derive(Debug)]
 pub struct CertStore {
     provider: Arc<CryptoProvider>,
     current: ArcSwap<Certs>,
+    /// ACME certs by hostname. Kept apart from `current`, so a reload can't drop a cert
+    /// issued while it was loading.
+    acme: ArcSwap<HashMap<String, Arc<CertifiedKey>>>,
+    /// Present with `[acme]`, to answer TLS-ALPN-01 challenges.
+    challenges: Option<Arc<Challenges>>,
 }
 
 impl CertStore {
-    pub fn new(config: &Config) -> io::Result<Self> {
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    pub fn new(config: &Config, challenges: Option<Arc<Challenges>>) -> io::Result<Self> {
+        let provider = Arc::new(provider());
         let certs = Certs::new(config, &provider, None)?;
-        Ok(Self { provider, current: ArcSwap::from_pointee(certs) })
+        let acme = ArcSwap::default();
+        Ok(Self { provider, current: ArcSwap::from_pointee(certs), acme, challenges })
     }
 
     /// Loads `config`'s certificates without applying them; see [`CertStore::store`].
@@ -40,8 +52,24 @@ impl CertStore {
         self.current.store(Arc::new(certs));
     }
 
+    /// Replaces every ACME cert, keyed by hostname.
+    pub fn store_acme(&self, certs: HashMap<String, Arc<CertifiedKey>>) {
+        self.acme.store(Arc::new(certs));
+    }
+
+    /// The cert for `sni`, or the default site's for unknown names and clients without SNI;
+    /// `None` aborts the handshake.
+    fn lookup(&self, sni: Option<&str>) -> Option<Arc<CertifiedKey>> {
+        let (certs, acme) = (self.current.load(), self.acme.load());
+        let acme_cert = |host: &str| acme.get(host.strip_suffix('.').unwrap_or(host)).cloned();
+        // ACME names never overlap with cert files or localhost names.
+        sni.and_then(acme_cert)
+            .or_else(|| certs.lookup(sni))
+            .or_else(|| certs.default_acme.as_deref().and_then(acme_cert))
+    }
+
     /// rustls settings for the HTTPS listener: TLS 1.2 and 1.3, certs from this store by SNI,
-    /// h2 or HTTP/1.1 by ALPN.
+    /// h2 or HTTP/1.1 by ALPN, and `acme-tls/1` with challenges.
     pub fn server_config(self: &Arc<Self>) -> ServerConfig {
         let mut tls = ServerConfig::builder_with_provider(Arc::clone(&self.provider))
             .with_safe_default_protocol_versions()
@@ -49,13 +77,20 @@ impl CertStore {
             .with_no_client_auth()
             .with_cert_resolver(Arc::clone(self) as Arc<dyn ResolvesServerCert>);
         tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        if self.challenges.is_some() {
+            tls.alpn_protocols.push(ACME_TLS_ALPN.to_vec());
+        }
         tls
     }
 }
 
 impl ResolvesServerCert for CertStore {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        self.current.load().lookup(hello.server_name())
+        let acme = hello.alpn().is_some_and(|mut protocols| protocols.any(|p| p == ACME_TLS_ALPN));
+        match &self.challenges {
+            Some(challenges) if acme => challenges.tls_alpn_cert(hello.server_name()?),
+            _ => self.lookup(hello.server_name()),
+        }
     }
 }
 
@@ -67,6 +102,9 @@ pub struct Certs {
     default: Option<Arc<CertifiedKey>>,
     /// Self-signed certs by the names they cover, for reuse on reload.
     self_signed: HashMap<Vec<String>, Arc<CertifiedKey>>,
+    /// A name of the default site whose ACME cert serves unknown names, when the default
+    /// site has neither cert files nor a self-signed cert.
+    default_acme: Option<String>,
 }
 
 impl Certs {
@@ -81,7 +119,11 @@ impl Certs {
         let mut by_host = HashMap::new();
         let mut default = None;
         let mut self_signed_certs = HashMap::new();
+        let mut default_acme = None;
         for (i, site) in config.sites.iter().enumerate() {
+            if site.default && config.acme.is_some() {
+                default_acme = site.acme_hosts().next().cloned();
+            }
             let in_site = |e: io::Error| io::Error::new(e.kind(), format!("site {}: {e}", i + 1));
             let (certified, hosts): (_, Vec<_>) = match (&site.cert, &site.key) {
                 (Some(cert), Some(key)) => (
@@ -110,10 +152,10 @@ impl Certs {
                 default = Some(certified);
             }
         }
-        Ok(Self { by_host, default, self_signed: self_signed_certs })
+        Ok(Self { by_host, default, self_signed: self_signed_certs, default_acme })
     }
 
-    /// `None` aborts the handshake.
+    /// Cert files and self-signed certs only; [`CertStore::lookup`] adds ACME certs.
     fn lookup(&self, sni: Option<&str>) -> Option<Arc<CertifiedKey>> {
         // rustls has already lowercased the name.
         let host = sni.map(|name| name.strip_suffix('.').unwrap_or(name));
@@ -297,7 +339,7 @@ pub(crate) mod tests {
         let local = |hosts: &str| {
             config(dir.path(), &format!("[[site]]\nhosts = [{hosts}]\nroot = \"www\"\n"))
         };
-        let store = CertStore::new(&local("\"localhost\"")).unwrap();
+        let store = CertStore::new(&local("\"localhost\""), None).unwrap();
         let first = store.current.load().lookup(Some("localhost")).unwrap();
 
         store.store(store.load(&local("\"localhost\"")).unwrap());
@@ -311,11 +353,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn acme_certs_are_served_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let sites = "[[site]]\nhosts = [\"example.com\", \"localhost\"]\nroot = \"www\"\n\
+                     [[site]]\nhosts = [\"other.test\"]\nroot = \"www\"\ndefault = true\n\
+                     [acme]\n";
+        let store = CertStore::new(&config(dir.path(), sites), None).unwrap();
+        assert!(store.lookup(Some("example.com")).is_none(), "not issued yet");
+        let local = store.lookup(Some("localhost")).unwrap();
+
+        let issued = |host: &str| Arc::new(self_signed(&[&host.to_owned()], &provider()).unwrap());
+        let (example, other) = (issued("example.com"), issued("other.test"));
+        store.store_acme(HashMap::from([
+            ("example.com".to_owned(), Arc::clone(&example)),
+            ("other.test".to_owned(), Arc::clone(&other)),
+        ]));
+        let is = |sni, cert: &Arc<CertifiedKey>| Arc::ptr_eq(&store.lookup(sni).unwrap(), cert);
+        assert!(is(Some("example.com"), &example));
+        assert!(is(Some("example.com."), &example));
+        assert!(is(Some("localhost"), &local), "localhost stays self-signed");
+        assert!(is(Some("unknown.test"), &other), "unknown names get the default site's cert");
+        assert!(is(None, &other));
+    }
+
+    #[test]
     fn reload_rereads_cert_files() {
         let dir = tempfile::tempdir().unwrap();
         write_pair(dir.path(), "a.test");
         let sites = config(dir.path(), &site("a.test", "a.test", false));
-        let store = CertStore::new(&sites).unwrap();
+        let store = CertStore::new(&sites, None).unwrap();
 
         let (renewed, _) = write_pair(dir.path(), "a.test");
         store.store(store.load(&sites).unwrap());

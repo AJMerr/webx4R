@@ -12,16 +12,20 @@ arc-swap.workspace = true
 bytes.workspace = true
 http.workspace = true
 http-body-util.workspace = true
-hyper = { workspace = true, features = ["client", "http1", "http2", "server"] }
+httpdate.workspace = true
+hyper ={ workspace = true, features = ["client", "http1", "http2", "server"] }
 hyper-util = { workspace = true, features = ["client-legacy", "http1", "http2", "server-auto", "server-graceful", "tokio"] }
+instant-acme.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 serde.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "time"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-rustls.workspace = true
 toml.workspace = true
 tracing.workspace = true
 webxlib.workspace = true
+x509-parser.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
