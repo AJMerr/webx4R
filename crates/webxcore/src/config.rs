@@ -22,7 +22,9 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct Server {
     /// Address for plain HTTP, e.g. `0.0.0.0:8080`.
-    pub http: SocketAddr,
+    pub http: Option<SocketAddr>,
+    /// Address for HTTPS, e.g. `0.0.0.0:8443`.
+    pub https: Option<SocketAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -42,6 +44,10 @@ pub struct Site {
     pub allow_dotfiles: bool,
     #[serde(default)]
     pub symlinks: SymlinkSetting,
+    /// PEM certificate chain for HTTPS; resolved like `root`.
+    pub cert: Option<PathBuf>,
+    /// PEM private key for `cert`.
+    pub key: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -54,6 +60,11 @@ pub enum SymlinkSetting {
 }
 
 impl Site {
+    /// Whether HTTPS can serve this site: it has cert files, or a localhost name to self-sign.
+    pub fn has_tls(&self) -> bool {
+        self.cert.is_some() || self.hosts.iter().any(|host| is_localhost(host))
+    }
+
     pub fn policy(&self) -> PathPolicy {
         PathPolicy {
             allow_dotfiles: self.allow_dotfiles,
@@ -99,6 +110,9 @@ impl Config {
         let mut config: Self = toml::from_str(text).map_err(ConfigError::Parse)?;
         for site in &mut config.sites {
             site.root = base.join(&site.root);
+            for path in [&mut site.cert, &mut site.key].into_iter().flatten() {
+                *path = base.join(&*path);
+            }
             for host in &mut site.hosts {
                 host.make_ascii_lowercase();
             }
@@ -109,6 +123,9 @@ impl Config {
 
     fn validate(&self) -> Result<(), ConfigError> {
         let invalid = |msg: String| Err(ConfigError::Invalid(msg));
+        if self.server.http.is_none() && self.server.https.is_none() {
+            return invalid("[server] needs `http`, `https` or both".into());
+        }
         if self.sites.is_empty() {
             return invalid("config needs at least one [[site]]".into());
         }
@@ -126,6 +143,14 @@ impl Config {
             if site.hosts.is_empty() && !site.default {
                 return invalid(format!("site {n} needs `hosts`, or `default = true`"));
             }
+            match (&site.cert, &site.key) {
+                (Some(_), None) => return invalid(format!("site {n} has `cert` but no `key`")),
+                (None, Some(_)) => return invalid(format!("site {n} has `key` but no `cert`")),
+                _ => {}
+            }
+            if site.cert.is_some() && self.server.https.is_none() {
+                return invalid(format!("site {n} has a `cert`, but [server] has no `https`"));
+            }
             for host in &site.hosts {
                 if !is_hostname(host) {
                     return invalid(format!(
@@ -138,8 +163,18 @@ impl Config {
                 }
             }
         }
+        if self.server.https.is_some() && !self.sites.iter().any(Site::has_tls) {
+            return invalid(
+                "[server] has `https`, but no site has a `cert` or a localhost host".into(),
+            );
+        }
         Ok(())
     }
+}
+
+/// `localhost` and its subdomains, which RFC 6761 reserves for loopback.
+pub fn is_localhost(host: &str) -> bool {
+    host == "localhost" || host.ends_with(".localhost")
 }
 
 /// ASCII letters, digits, `-` and `.`, in non-empty dot-separated labels.
@@ -180,7 +215,8 @@ mod tests {
     #[test]
     fn minimal_config_with_defaults() {
         let config = parse(MINIMAL).unwrap();
-        assert_eq!(config.server.http, "0.0.0.0:8080".parse().unwrap());
+        assert_eq!(config.server.http, Some("0.0.0.0:8080".parse().unwrap()));
+        assert_eq!(config.server.https, None);
         let site = &config.sites[0];
         assert_eq!(site.root, Path::new("/etc/webx4r/www"));
         assert!(!site.default && !site.directory_listing && !site.allow_dotfiles);
@@ -228,6 +264,14 @@ mod tests {
     }
 
     #[test]
+    fn needs_an_address() {
+        let msg = invalid(&MINIMAL.replace("http = \"0.0.0.0:8080\"", ""));
+        assert_eq!(msg, "[server] needs `http`, `https` or both");
+        let https_only = MINIMAL.replace("http =", "https =") + "cert = \"a.crt\"\nkey = \"a.key\"";
+        assert_eq!(parse(&https_only).unwrap().server.http, None);
+    }
+
+    #[test]
     fn needs_a_site() {
         let msg = invalid("[server]\nhttp = \"0.0.0.0:8080\"");
         assert_eq!(msg, "config needs at least one [[site]]");
@@ -269,6 +313,53 @@ mod tests {
     fn hosts_are_unique_across_sites() {
         let text = format!("{MINIMAL}\n[[site]]\nhosts = [\"EXAMPLE.com\"]\nroot = \"other\"");
         assert_eq!(invalid(&text), "\"example.com\" is listed in both site 1 and 2");
+    }
+
+    const HTTPS: &str = "https = \"0.0.0.0:8443\"";
+    const CERT: &str = "cert = \"certs/a.crt\"\nkey = \"/keys/a.key\"";
+
+    fn with_tls(server: &str, site: &str) -> String {
+        MINIMAL.replace("0.0.0.0:8080\"", &format!("0.0.0.0:8080\"\n{server}")) + site
+    }
+
+    #[test]
+    fn tls_settings() {
+        let config = parse(&with_tls(HTTPS, CERT)).unwrap();
+        assert_eq!(config.server.https, Some("0.0.0.0:8443".parse().unwrap()));
+        let site = &config.sites[0];
+        assert_eq!(site.cert.as_deref(), Some(Path::new("/etc/webx4r/certs/a.crt")));
+        assert_eq!(site.key.as_deref(), Some(Path::new("/keys/a.key")));
+        assert!(site.has_tls());
+    }
+
+    #[test]
+    fn cert_and_key_go_together() {
+        let no_key = invalid(&with_tls(HTTPS, "cert = \"a.crt\""));
+        let no_cert = invalid(&with_tls(HTTPS, "key = \"a.key\""));
+        assert_eq!(no_key, "site 1 has `cert` but no `key`");
+        assert_eq!(no_cert, "site 1 has `key` but no `cert`");
+    }
+
+    #[test]
+    fn cert_needs_https() {
+        let msg = invalid(&with_tls("", CERT));
+        assert_eq!(msg, "site 1 has a `cert`, but [server] has no `https`");
+    }
+
+    #[test]
+    fn https_needs_a_site_with_tls() {
+        let msg = invalid(&with_tls(HTTPS, ""));
+        assert_eq!(msg, "[server] has `https`, but no site has a `cert` or a localhost host");
+        for host in ["localhost", "app.localhost"] {
+            let config = parse(&with_tls(HTTPS, "").replace("example.com", host)).unwrap();
+            assert!(config.sites[0].has_tls(), "{host}");
+        }
+    }
+
+    #[test]
+    fn localhost_names() {
+        assert!(is_localhost("localhost") && is_localhost("a.b.localhost"));
+        assert!(!is_localhost("mylocalhost") && !is_localhost("localhost.com"));
     }
 
     #[test]

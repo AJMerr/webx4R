@@ -31,15 +31,19 @@ fn serve(config: &Path) -> (Child, BufReader<ChildStderr>) {
     (child, stderr)
 }
 
-/// Reads log lines until the server reports its address.
-fn listening_addr(stderr: &mut BufReader<ChildStderr>) -> String {
+/// Reads log lines until the server reports its `scheme` address; returns it and the log before it.
+fn listening_addr(stderr: &mut BufReader<ChildStderr>, scheme: &str) -> (String, String) {
+    let marker = format!("listening on {scheme}://");
+    let mut log = String::new();
     for line in stderr.lines() {
         let line = line.unwrap();
-        if let Some(addr) = line.split("listening on http://").nth(1) {
-            return addr.trim().to_owned();
+        if let Some(addr) = line.split(&marker).nth(1) {
+            return (addr.trim().to_owned(), log);
         }
+        log.push_str(&line);
+        log.push('\n');
     }
-    panic!("webx4r exited without reporting its address");
+    panic!("webx4r exited without reporting its {scheme} address:\n{log}");
 }
 
 fn get(addr: &str) -> String {
@@ -54,11 +58,27 @@ fn get(addr: &str) -> String {
 fn serves_the_configured_site() {
     let (_dir, config) = site();
     let (mut child, mut stderr) = serve(&config);
-    let response = get(&listening_addr(&mut stderr));
+    let response = get(&listening_addr(&mut stderr, "http").0);
     child.kill().unwrap();
     child.wait().unwrap();
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
     assert!(response.ends_with("hello from webx4r"), "{response}");
+}
+
+#[test]
+fn serves_https_only_with_a_self_signed_localhost_cert() {
+    let (_dir, config) = site();
+    let text = "[server]\nhttps = \"127.0.0.1:0\"\n\
+                [[site]]\nhosts = [\"localhost\"]\nroot = \"www\"\ndefault = true\n";
+    fs::write(&config, text).unwrap();
+    let (mut child, mut stderr) = serve(&config);
+    let (addr, log) = listening_addr(&mut stderr, "https");
+    let connected = TcpStream::connect(&addr);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(log.contains("using a self-signed certificate"), "{log}");
+    assert!(!log.contains("listening on http://"), "{log}");
+    connected.unwrap();
 }
 
 #[cfg(unix)]
@@ -66,7 +86,7 @@ fn serves_the_configured_site() {
 fn sigterm_shuts_down_cleanly() {
     let (_dir, config) = site();
     let (mut child, mut stderr) = serve(&config);
-    listening_addr(&mut stderr);
+    listening_addr(&mut stderr, "http");
 
     let killed = Command::new("kill").arg("-TERM").arg(child.id().to_string()).status().unwrap();
     assert!(killed.success());

@@ -1,4 +1,4 @@
-//! HTTP listener: accepts connections and routes each request to a site by its host.
+//! HTTP and HTTPS listeners: accept connections and route each request to a site by its host.
 
 #[cfg(test)]
 mod tests;
@@ -17,13 +17,16 @@ use http::{Request, Response, StatusCode, Version};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
-use hyper_util::server::graceful::GracefulShutdown;
+use hyper_util::server::graceful::{GracefulShutdown, Watcher};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 use webxlib::body::Body;
 use webxlib::pages;
 use webxlib::static_files::StaticFiles;
 
 use crate::config::Config;
+use crate::tls;
 
 /// How long shutdown waits for in-flight requests before dropping them.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -31,21 +34,58 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Pause after a failed accept; errors like running out of file descriptors repeat instantly.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
+/// How long a client gets to finish the TLS handshake; hyper's header timeout starts after it.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+type ConnBuilder = auto::Builder<TokioExecutor>;
+
 pub struct Server {
-    listener: TcpListener,
+    http: Option<Listener>,
+    https: Option<Listener>,
     router: Arc<Router>,
 }
 
+/// A bound socket; the HTTPS one carries its TLS acceptor.
+struct Listener {
+    tcp: TcpListener,
+    addr: SocketAddr,
+    tls: Option<TlsAcceptor>,
+}
+
+impl Listener {
+    async fn bind(addr: SocketAddr, tls: Option<TlsAcceptor>) -> io::Result<Self> {
+        let tcp = TcpListener::bind(addr)
+            .await
+            .map_err(|e| io::Error::new(e.kind(), format!("can't listen on {addr}: {e}")))?;
+        Ok(Self { addr: tcp.local_addr()?, tcp, tls })
+    }
+}
+
 impl Server {
-    /// Opens every site root, then binds the HTTP listener.
+    /// Opens every site root and loads every cert, then binds the listeners.
     pub async fn bind(config: &Config) -> io::Result<Self> {
         let router = Arc::new(Router::new(config)?);
-        let listener = TcpListener::bind(config.server.http).await?;
-        Ok(Self { listener, router })
+        let https = match config.server.https {
+            Some(addr) => Some((addr, TlsAcceptor::from(Arc::new(tls::server_config(config)?)))),
+            None => None,
+        };
+        let http = match config.server.http {
+            Some(addr) => Some(Listener::bind(addr, None).await?),
+            None => None,
+        };
+        let https = match https {
+            Some((addr, acceptor)) => Some(Listener::bind(addr, Some(acceptor)).await?),
+            None => None,
+        };
+        Ok(Self { http, https, router })
     }
 
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.listener.local_addr()
+    pub fn http_addr(&self) -> Option<SocketAddr> {
+        self.http.as_ref().map(|listener| listener.addr)
+    }
+
+    pub fn https_addr(&self) -> Option<SocketAddr> {
+        self.https.as_ref().map(|listener| listener.addr)
     }
 
     /// Serves until `shutdown` resolves, then lets in-flight requests finish.
@@ -53,44 +93,90 @@ impl Server {
         let mut builder = auto::Builder::new(TokioExecutor::new());
         // Enables hyper's header-read timeout, which guards against slow-header attacks.
         builder.http1().timer(TokioTimer::new());
+        let builder = Arc::new(builder);
         let graceful = GracefulShutdown::new();
-        tokio::pin!(shutdown);
 
+        let http = self.accept(self.http.as_ref(), &builder, &graceful);
+        let https = self.accept(self.https.as_ref(), &builder, &graceful);
+        tokio::select! {
+            _ = async { tokio::join!(http, https) } => {}
+            () = shutdown => {}
+        }
+
+        // Closes the listeners, so new connections are refused while in-flight ones finish.
+        drop(self);
+        if tokio::time::timeout(DRAIN_TIMEOUT, graceful.shutdown()).await.is_err() {
+            tracing::warn!(
+                "in-flight requests still running after {DRAIN_TIMEOUT:?}; dropping them"
+            );
+        }
+    }
+
+    /// Accepts connections until dropped; with no listener, waits forever.
+    async fn accept(
+        &self,
+        listener: Option<&Listener>,
+        builder: &Arc<ConnBuilder>,
+        graceful: &GracefulShutdown,
+    ) {
+        let Some(listener) = listener else { return std::future::pending().await };
         loop {
-            let (stream, peer) = tokio::select! {
-                accepted = self.listener.accept() => match accepted {
-                    Ok(accepted) => accepted,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "accept failed");
-                        tokio::time::sleep(ACCEPT_BACKOFF).await;
-                        continue;
-                    }
-                },
-                () = &mut shutdown => break,
+            let (stream, peer) = match listener.tcp.accept().await {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    tracing::warn!(error = %e, "accept failed");
+                    tokio::time::sleep(ACCEPT_BACKOFF).await;
+                    continue;
+                }
             };
             if let Err(e) = stream.set_nodelay(true) {
                 tracing::debug!(%peer, error = %e, "couldn't set TCP_NODELAY");
             }
 
-            let router = Arc::clone(&self.router);
-            let service = service_fn(move |req| {
-                let router = Arc::clone(&router);
-                async move { Ok::<_, Infallible>(router.handle(req).await) }
-            });
-            let conn = builder.serve_connection_with_upgrades(TokioIo::new(stream), service);
-            let conn = graceful.watch(conn.into_owned());
-            tokio::spawn(async move {
-                if let Err(e) = conn.await {
-                    tracing::debug!(%peer, error = %e, "connection ended with an error");
-                }
-            });
+            let conn = Connection {
+                peer,
+                router: Arc::clone(&self.router),
+                builder: Arc::clone(builder),
+                watcher: graceful.watcher(),
+            };
+            // The handshake runs in the connection's task so a slow client can't stall accepts.
+            match listener.tls.clone() {
+                None => tokio::spawn(conn.serve(stream)),
+                Some(acceptor) => tokio::spawn(async move {
+                    let handshake = acceptor.accept(stream);
+                    match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, handshake).await {
+                        Ok(Ok(stream)) => conn.serve(stream).await,
+                        Ok(Err(e)) => tracing::debug!(%peer, error = %e, "TLS handshake failed"),
+                        Err(_) => tracing::debug!(%peer, "TLS handshake timed out"),
+                    }
+                }),
+            };
         }
+    }
+}
 
-        drop(self.listener);
-        if tokio::time::timeout(DRAIN_TIMEOUT, graceful.shutdown()).await.is_err() {
-            tracing::warn!(
-                "in-flight requests still running after {DRAIN_TIMEOUT:?}; dropping them"
-            );
+/// An accepted connection, served once any TLS handshake is done.
+struct Connection {
+    peer: SocketAddr,
+    router: Arc<Router>,
+    builder: Arc<ConnBuilder>,
+    /// Held from accept, so shutdown also waits for handshakes in progress.
+    watcher: Watcher,
+}
+
+impl Connection {
+    async fn serve<I>(self, io: I)
+    where
+        I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let Self { peer, router, builder, watcher } = self;
+        let service = service_fn(move |req| {
+            let router = Arc::clone(&router);
+            async move { Ok::<_, Infallible>(router.handle(req).await) }
+        });
+        let conn = builder.serve_connection_with_upgrades(TokioIo::new(io), service);
+        if let Err(e) = watcher.watch(conn.into_owned()).await {
+            tracing::debug!(%peer, error = %e, "connection ended with an error");
         }
     }
 }

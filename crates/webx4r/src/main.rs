@@ -57,9 +57,11 @@ async fn serve(path: &Path) -> ExitCode {
         Ok(server) => server,
         Err(e) => return fail(e),
     };
-    match server.local_addr() {
-        Ok(addr) => tracing::info!("listening on http://{addr}"),
-        Err(e) => return fail(e),
+    if let Some(addr) = server.http_addr() {
+        tracing::info!("listening on http://{addr}");
+    }
+    if let Some(addr) = server.https_addr() {
+        tracing::info!("listening on https://{addr}");
     }
 
     server.run(shutdown_signal()).await;
