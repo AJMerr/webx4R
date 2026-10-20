@@ -7,6 +7,8 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 use webxcore::config::{Config, ConfigError};
+#[cfg(unix)]
+use webxcore::server::Reloader;
 use webxcore::server::Server;
 
 /// Log filter variable, e.g. `WEBX4R_LOG=debug`.
@@ -50,8 +52,7 @@ fn init_logging() {
 async fn serve(path: &Path) -> ExitCode {
     let config = match Config::load(path) {
         Ok(config) => config,
-        Err(e @ ConfigError::Read { .. }) => return fail(e),
-        Err(e) => return fail(format!("{}: {e}", path.display())),
+        Err(e) => return fail(describe(path, e)),
     };
     let server = match Server::bind(&config).await {
         Ok(server) => server,
@@ -64,6 +65,15 @@ async fn serve(path: &Path) -> ExitCode {
         tracing::info!("listening on https://{addr}");
     }
 
+    // Registered before serving: until a handler exists, SIGHUP would kill the process.
+    #[cfg(unix)]
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+        Ok(hangups) => {
+            tokio::spawn(reload_on_hangup(hangups, path.to_owned(), server.reloader()));
+        }
+        Err(e) => tracing::warn!(error = %e, "can't listen for SIGHUP"),
+    }
+
     server.run(shutdown_signal()).await;
     tracing::info!("stopped");
     ExitCode::SUCCESS
@@ -72,6 +82,33 @@ async fn serve(path: &Path) -> ExitCode {
 fn fail(error: impl std::fmt::Display) -> ExitCode {
     tracing::error!("{error}");
     ExitCode::FAILURE
+}
+
+/// A config error, naming the file unless the message already does.
+fn describe(path: &Path, error: ConfigError) -> String {
+    match error {
+        e @ ConfigError::Read { .. } => e.to_string(),
+        e => format!("{}: {e}", path.display()),
+    }
+}
+
+/// Re-reads and applies the config file on each SIGHUP, as sent by `systemctl reload` or
+/// `kill -HUP`. A failed reload is logged and the old config stays.
+#[cfg(unix)]
+async fn reload_on_hangup(
+    mut hangups: tokio::signal::unix::Signal,
+    path: PathBuf,
+    reloader: Reloader,
+) {
+    while hangups.recv().await.is_some() {
+        let result = Config::load(&path)
+            .map_err(|e| describe(&path, e))
+            .and_then(|config| reloader.reload(&config).map_err(|e| e.to_string()));
+        match result {
+            Ok(()) => tracing::info!("reloaded {}", path.display()),
+            Err(e) => tracing::error!("reload failed: {e}"),
+        }
+    }
 }
 
 /// Resolves on Ctrl-C, or on SIGTERM (sent by `systemctl stop`, `kill` and Docker) on Unix.

@@ -125,6 +125,50 @@ fn serves_https_only_with_a_self_signed_localhost_cert() {
     connected.unwrap();
 }
 
+/// Reads log lines until one contains `needle`, and returns it.
+fn wait_for_log(stderr: &mut BufReader<ChildStderr>, needle: &str) -> String {
+    for line in stderr.lines() {
+        let line = line.unwrap();
+        if line.contains(needle) {
+            return line;
+        }
+    }
+    panic!("webx4r exited before logging {needle:?}");
+}
+
+#[cfg(unix)]
+fn send_signal(child: &Child, name: &str) {
+    let sent = Command::new("kill").arg(format!("-{name}")).arg(child.id().to_string()).status();
+    assert!(sent.unwrap().success(), "kill -{name} failed");
+}
+
+#[cfg(unix)]
+#[test]
+fn sighup_reloads_the_config_file() {
+    let (dir, config) = site();
+    fs::create_dir(dir.path().join("www2")).unwrap();
+    fs::write(dir.path().join("www2/index.html"), "reloaded site").unwrap();
+    let (mut child, mut stderr) = serve(&config);
+    let addr = listening_addr(&mut stderr, "http").0;
+
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(&config, text.replace("\"www\"", "\"www2\"")).unwrap();
+    send_signal(&child, "HUP");
+    wait_for_log(&mut stderr, "reloaded");
+    let reloaded = get(&addr);
+
+    fs::write(&config, "not a config").unwrap();
+    send_signal(&child, "HUP");
+    let failure = wait_for_log(&mut stderr, "reload failed");
+    let kept = get(&addr);
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    assert!(reloaded.ends_with("reloaded site"), "{reloaded}");
+    assert!(failure.contains("webx4r.toml"), "names the file: {failure}");
+    assert!(kept.ends_with("reloaded site"), "a failed reload keeps the old config: {kept}");
+}
+
 #[cfg(unix)]
 #[test]
 fn sigterm_shuts_down_cleanly() {
@@ -132,8 +176,7 @@ fn sigterm_shuts_down_cleanly() {
     let (mut child, mut stderr) = serve(&config);
     listening_addr(&mut stderr, "http");
 
-    let killed = Command::new("kill").arg("-TERM").arg(child.id().to_string()).status().unwrap();
-    assert!(killed.success());
+    send_signal(&child, "TERM");
     let status = child.wait().unwrap();
     let mut rest = String::new();
     stderr.read_to_string(&mut rest).unwrap();
