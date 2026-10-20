@@ -10,13 +10,16 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use http::header::CONTENT_TYPE;
 use http::{Method, Request, Response};
 use instant_acme::{Account, AccountBuilder, AccountCredentials, NewAccount};
-use rustls::pki_types::PrivatePkcs8KeyDer;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
 use webxlib::body::Body;
+use x509_parser::extensions::GeneralName;
 
 use crate::config::Acme;
 use crate::tls;
@@ -115,6 +118,83 @@ impl Storage {
 
     fn account_path(&self) -> PathBuf {
         self.dir.join("account.json")
+    }
+
+    /// One PEM file with the private key and the chain, so a single rename replaces both.
+    /// Named after the first name, so certs for a site's old and new names share a file.
+    fn cert_path(&self, names: &[String]) -> PathBuf {
+        self.dir.join("certs").join(format!("{}.pem", names[0]))
+    }
+
+    /// The saved cert for `names`, if there is one that covers them all.
+    pub fn load_cert(&self, names: &[String]) -> io::Result<Option<Issued>> {
+        let path = self.cert_path(names);
+        let Some(pem) = read_if_exists(&path)? else { return Ok(None) };
+        let issued = Issued::parse(&pem)
+            .map_err(|e| io::Error::new(e.kind(), format!("can't load {}: {e}", path.display())))?;
+        Ok(issued.covers(names).then_some(issued))
+    }
+
+    /// Checks the CA's `chain_pem` against `key_pem`, then saves both for `names`.
+    pub fn save_cert(
+        &self,
+        names: &[String],
+        key_pem: &str,
+        chain_pem: &str,
+    ) -> io::Result<Issued> {
+        let pem = format!("{}\n{chain_pem}", key_pem.trim_end());
+        let issued = Issued::parse(pem.as_bytes()).map_err(|e| {
+            io::Error::new(e.kind(), format!("the CA's certificate for {names:?} is unusable: {e}"))
+        })?;
+        write_private(&self.cert_path(names), pem.as_bytes())?;
+        Ok(issued)
+    }
+}
+
+/// A certificate from the CA, ready to serve.
+#[derive(Debug, Clone)]
+pub struct Issued {
+    pub certified: Arc<CertifiedKey>,
+    /// The DNS names it covers.
+    pub names: Vec<String>,
+    /// When a third of its lifetime is left, as Let's Encrypt recommends.
+    pub renew_at: SystemTime,
+}
+
+impl Issued {
+    /// Reads a private key and certificate chain from `pem`, and checks that they match.
+    fn parse(pem: &[u8]) -> io::Result<Self> {
+        let invalid = |e: &dyn Display| io::Error::new(io::ErrorKind::InvalidData, e.to_string());
+        let chain = CertificateDer::pem_slice_iter(pem)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| invalid(&e))?;
+        let leaf = chain.first().ok_or_else(|| invalid(&"no certificates found"))?;
+        let (_, x509) = x509_parser::parse_x509_certificate(leaf).map_err(|e| invalid(&e))?;
+        let names = match x509.subject_alternative_name().map_err(|e| invalid(&e))? {
+            Some(san) => san
+                .value
+                .general_names
+                .iter()
+                .filter_map(|name| match name {
+                    GeneralName::DNSName(name) => Some(name.to_ascii_lowercase()),
+                    _ => None,
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        let validity = x509.validity();
+        let (start, end) = (validity.not_before.timestamp(), validity.not_after.timestamp());
+        let renew_at = end - (end - start) / 3;
+        let renew_at = UNIX_EPOCH + Duration::from_secs(u64::try_from(renew_at).unwrap_or(0));
+
+        let key = PrivateKeyDer::from_pem_slice(pem).map_err(|e| invalid(&e))?;
+        let certified =
+            CertifiedKey::from_der(chain, key, &tls::provider()).map_err(|e| invalid(&e))?;
+        Ok(Self { certified: Arc::new(certified), names, renew_at })
+    }
+
+    fn covers(&self, names: &[String]) -> bool {
+        names.iter().all(|name| self.names.contains(name))
     }
 }
 

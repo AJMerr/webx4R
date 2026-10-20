@@ -1689,6 +1689,7 @@ dependencies = [
  "toml",
  "tracing",
  "webxlib",
+ "x509-parser",
 ]
 
 [[package]]

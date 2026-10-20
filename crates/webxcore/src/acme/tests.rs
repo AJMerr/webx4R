@@ -130,6 +130,65 @@ fn tls_alpn_certs_carry_the_digest() {
     assert!(challenges.tls_alpn_cert("a.test").is_none());
 }
 
+/// A key and cert for `names` as PEM, valid for 90 days from 2026-01-01.
+fn issued_pem(names: &[String]) -> (String, String) {
+    let mut params = rcgen::CertificateParams::new(names).unwrap();
+    params.not_before = rcgen::date_time_ymd(2026, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2026, 4, 1);
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = params.self_signed(&key).unwrap();
+    (key.serialize_pem(), cert.pem())
+}
+
+fn names(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| name.to_string()).collect()
+}
+
+#[test]
+fn saved_certs_load_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path(), "https://ca.test/dir");
+    let site = names(&["a.test", "www.a.test"]);
+    assert!(storage.load_cert(&site).unwrap().is_none());
+
+    let (key, chain) = issued_pem(&site);
+    let saved = storage.save_cert(&site, &key, &chain).unwrap();
+    assert_eq!(saved.names, site);
+    let march_2 = rcgen::date_time_ymd(2026, 3, 2).unix_timestamp() as u64;
+    assert_eq!(saved.renew_at, UNIX_EPOCH + Duration::from_secs(march_2), "30 of 90 days left");
+
+    let loaded = storage.load_cert(&site).unwrap().unwrap();
+    assert_eq!(loaded.certified.cert, saved.certified.cert);
+    assert_eq!(loaded.renew_at, saved.renew_at);
+    assert!(
+        storage.load_cert(&names(&["a.test"])).unwrap().is_some(),
+        "fewer names: still covered"
+    );
+    let more = names(&["a.test", "new.a.test"]);
+    assert!(storage.load_cert(&more).unwrap().is_none(), "new names need a new cert");
+}
+
+#[test]
+fn unusable_certs_are_not_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path(), "https://ca.test/dir");
+    let site = names(&["a.test"]);
+    let ((key, _), (_, other_chain)) = (issued_pem(&site), issued_pem(&site));
+    let err = storage.save_cert(&site, &key, &other_chain).unwrap_err().to_string();
+    assert!(err.starts_with("the CA's certificate for [\"a.test\"] is unusable"), "{err}");
+    assert!(storage.load_cert(&site).unwrap().is_none());
+}
+
+#[test]
+fn corrupt_cert_files_are_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path(), "https://ca.test/dir");
+    let site = names(&["a.test"]);
+    write_private(&storage.cert_path(&site), b"garbage").unwrap();
+    let err = storage.load_cert(&site).unwrap_err().to_string();
+    assert!(err.starts_with("can't load ") && err.ends_with("no certificates found"), "{err}");
+}
+
 #[test]
 fn storage_is_named_after_the_directory() {
     let root = Path::new("/state");
