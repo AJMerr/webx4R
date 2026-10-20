@@ -130,6 +130,7 @@ fn serves_https_only_with_a_self_signed_localhost_cert() {
 }
 
 /// Reads log lines until one contains `needle`, and returns it.
+#[cfg(unix)]
 fn wait_for_log(stderr: &mut BufReader<ChildStderr>, needle: &str) -> String {
     for line in stderr.lines() {
         let line = line.unwrap();
