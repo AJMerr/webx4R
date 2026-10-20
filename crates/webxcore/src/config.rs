@@ -1,6 +1,7 @@
 //! The `webx4r.toml` config file: parsing and validation.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
@@ -16,6 +17,9 @@ pub struct Config {
     pub server: Server,
     #[serde(rename = "site", default)]
     pub sites: Vec<Site>,
+    /// The folder relative paths resolve against: the config file's folder.
+    #[serde(skip)]
+    pub dir: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -25,6 +29,9 @@ pub struct Server {
     pub http: Option<SocketAddr>,
     /// Address for HTTPS, e.g. `0.0.0.0:8443`.
     pub https: Option<SocketAddr>,
+    /// Control socket path on Unix, pipe name (`\\.\pipe\…`) on Windows; resolved like `root`.
+    /// See [`Config::control_endpoint`] for the default.
+    pub control: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -120,9 +127,14 @@ impl Config {
         Self::parse(&text, base)
     }
 
-    /// Parses and validates `text`; relative site roots resolve against `base`.
+    /// Parses and validates `text`; relative paths resolve against `base`.
     pub fn parse(text: &str, base: &Path) -> Result<Self, ConfigError> {
         let mut config: Self = toml::from_str(text).map_err(ConfigError::Parse)?;
+        config.dir = base.to_owned();
+        if let Some(control) = &mut config.server.control {
+            // Pipe names are absolute paths on Windows, so `join` leaves them as they are.
+            *control = base.join(&*control);
+        }
         for site in &mut config.sites {
             for path in [&mut site.root, &mut site.cert, &mut site.key].into_iter().flatten() {
                 *path = base.join(&*path);
@@ -137,6 +149,15 @@ impl Config {
         }
         config.validate()?;
         Ok(config)
+    }
+
+    /// Where `webx4r reload` reaches the server: `[server] control`, or the default from
+    /// [`default_control_endpoint`].
+    pub fn control_endpoint(&self) -> PathBuf {
+        match &self.server.control {
+            Some(control) => control.clone(),
+            None => default_control_endpoint(&self.dir, std::env::var_os("XDG_RUNTIME_DIR")),
+        }
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -226,6 +247,36 @@ fn is_upstream(addr: &str) -> bool {
             port.parse::<u16>().is_ok_and(|port| port != 0) && is_hostname(host)
         }),
     }
+}
+
+/// Named after the config folder `dir`, so each config gets its own:
+/// - Windows: `\\.\pipe\webx4r-<hash>`
+/// - Unix: `$XDG_RUNTIME_DIR/webx4r-<hash>.sock`, a short per-user path; socket paths are
+///   limited to about 100 bytes. Without that variable, `webx4r.sock` in `dir`.
+fn default_control_endpoint(dir: &Path, runtime_dir: Option<OsString>) -> PathBuf {
+    let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+    let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_owned());
+    let key = dir.to_string_lossy();
+    if cfg!(windows) {
+        // Windows paths ignore case, so differently-cased spellings must name one pipe.
+        let hash = fnv1a(key.to_lowercase().as_bytes());
+        return PathBuf::from(format!(r"\\.\pipe\webx4r-{hash:016x}"));
+    }
+    match runtime_dir.map(PathBuf::from) {
+        // The XDG spec says to ignore a relative value.
+        Some(runtime_dir) if runtime_dir.is_absolute() => {
+            runtime_dir.join(format!("webx4r-{:016x}.sock", fnv1a(key.as_bytes())))
+        }
+        _ => dir.join("webx4r.sock"),
+    }
+}
+
+/// 64-bit FNV-1a: a hash that stays the same across Rust versions, unlike `DefaultHasher`,
+/// so a newer `webx4r reload` still finds an older server's pipe.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325, |hash, &b| (hash ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
 }
 
 /// `localhost` and its subdomains, which RFC 6761 reserves for loopback.
@@ -467,6 +518,53 @@ mod tests {
             let msg = invalid(&with_site(&proxy("/", &format!("\"{bad}\""))));
             assert!(msg.contains("must be host:port"), "{bad}: {msg}");
         }
+    }
+
+    #[test]
+    fn explicit_control_endpoint_resolves_like_root() {
+        let text = MINIMAL.replace("0.0.0.0:8080\"", "0.0.0.0:8080\"\ncontrol = \"run/ctl.sock\"");
+        let explicit = parse(&text).unwrap().control_endpoint();
+        assert_eq!(explicit, Path::new("/etc/webx4r/run/ctl.sock"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn default_control_endpoint_is_a_pipe_per_folder() {
+        let pipe = |dir: &str| default_control_endpoint(Path::new(dir), None);
+        assert!(pipe(r"C:\sites\a").to_string_lossy().starts_with(r"\\.\pipe\webx4r-"));
+        assert_eq!(pipe(r"C:\Sites\A"), pipe(r"c:\sites\a"), "case doesn't matter");
+        assert_ne!(pipe(r"C:\sites\a"), pipe(r"C:\sites\b"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_control_endpoint_is_a_short_per_user_socket() {
+        let runtime = Some(OsString::from("/run/user/1000"));
+        let a = default_control_endpoint(Path::new("/srv/a/deeply/nested/folder"), runtime.clone());
+        let b = default_control_endpoint(Path::new("/srv/b"), runtime);
+        assert_eq!(a.parent(), Some(Path::new("/run/user/1000")));
+        let name = a.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with("webx4r-") && name.ends_with(".sock") && name.len() == 28,
+            "{name}"
+        );
+        assert_ne!(a, b, "one socket per config folder");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_control_endpoint_without_a_runtime_dir() {
+        let dir = Path::new("/etc/webx4r");
+        let next_to_config = Path::new("/etc/webx4r/webx4r.sock");
+        assert_eq!(default_control_endpoint(dir, None), next_to_config);
+        let relative = Some(OsString::from("run"));
+        assert_eq!(default_control_endpoint(dir, relative), next_to_config, "relative is ignored");
+    }
+
+    #[test]
+    fn fnv1a_matches_the_reference() {
+        assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a(b"a"), 0xaf63_dc4c_8601_ec8c);
     }
 
     #[test]

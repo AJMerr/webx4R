@@ -8,10 +8,12 @@ use std::process::{Child, ChildStderr, Command, Stdio};
 
 use tempfile::TempDir;
 
-/// A temp folder with `www/index.html` and a `webx4r.toml` serving it on a random port.
+/// A temp folder with `www/index.html`, a `run` folder for control sockets, and a
+/// `webx4r.toml` serving `www` on a random port.
 fn site() -> (TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir(dir.path().join("www")).unwrap();
+    fs::create_dir(dir.path().join("run")).unwrap();
     fs::write(dir.path().join("www/index.html"), "hello from webx4r").unwrap();
     let config = dir.path().join("webx4r.toml");
     let text = "[server]\nhttp = \"127.0.0.1:0\"\n[[site]]\nroot = \"www\"\ndefault = true\n";
@@ -19,14 +21,16 @@ fn site() -> (TempDir, PathBuf) {
     (dir, config)
 }
 
+/// `webx4r <args> --config <config>`, with the control socket in the site's `run` folder.
+fn webx4r(args: &[&str], config: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_webx4r"));
+    command.args(args).arg("--config").arg(config);
+    command.env("XDG_RUNTIME_DIR", config.parent().unwrap().join("run"));
+    command
+}
+
 fn serve(config: &Path) -> (Child, BufReader<ChildStderr>) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_webx4r"))
-        .arg("serve")
-        .arg("--config")
-        .arg(config)
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = webx4r(&["serve"], config).stderr(Stdio::piped()).spawn().unwrap();
     let stderr = BufReader::new(child.stderr.take().unwrap());
     (child, stderr)
 }
@@ -125,20 +129,109 @@ fn serves_https_only_with_a_self_signed_localhost_cert() {
     connected.unwrap();
 }
 
+/// Reads log lines until one contains `needle`, and returns it.
+#[cfg(unix)]
+fn wait_for_log(stderr: &mut BufReader<ChildStderr>, needle: &str) -> String {
+    for line in stderr.lines() {
+        let line = line.unwrap();
+        if line.contains(needle) {
+            return line;
+        }
+    }
+    panic!("webx4r exited before logging {needle:?}");
+}
+
+#[cfg(unix)]
+fn send_signal(child: &Child, name: &str) {
+    let sent = Command::new("kill").arg(format!("-{name}")).arg(child.id().to_string()).status();
+    assert!(sent.unwrap().success(), "kill -{name} failed");
+}
+
+#[cfg(unix)]
+#[test]
+fn sighup_reloads_the_config_file() {
+    let (dir, config) = site();
+    fs::create_dir(dir.path().join("www2")).unwrap();
+    fs::write(dir.path().join("www2/index.html"), "reloaded site").unwrap();
+    let (mut child, mut stderr) = serve(&config);
+    let addr = listening_addr(&mut stderr, "http").0;
+
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(&config, text.replace("\"www\"", "\"www2\"")).unwrap();
+    send_signal(&child, "HUP");
+    wait_for_log(&mut stderr, "reloaded");
+    let reloaded = get(&addr);
+
+    fs::write(&config, "not a config").unwrap();
+    send_signal(&child, "HUP");
+    let failure = wait_for_log(&mut stderr, "reload failed");
+    let kept = get(&addr);
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    assert!(reloaded.ends_with("reloaded site"), "{reloaded}");
+    assert!(failure.contains("webx4r.toml"), "names the file: {failure}");
+    assert!(kept.ends_with("reloaded site"), "a failed reload keeps the old config: {kept}");
+}
+
 #[cfg(unix)]
 #[test]
 fn sigterm_shuts_down_cleanly() {
-    let (_dir, config) = site();
+    let (dir, config) = site();
     let (mut child, mut stderr) = serve(&config);
     listening_addr(&mut stderr, "http");
+    let sockets = || fs::read_dir(dir.path().join("run")).unwrap().count();
+    assert_eq!(sockets(), 1, "control socket in $XDG_RUNTIME_DIR");
 
-    let killed = Command::new("kill").arg("-TERM").arg(child.id().to_string()).status().unwrap();
-    assert!(killed.success());
+    send_signal(&child, "TERM");
     let status = child.wait().unwrap();
     let mut rest = String::new();
     stderr.read_to_string(&mut rest).unwrap();
     assert!(status.success(), "{status}: {rest}");
     assert!(rest.contains("shutting down") && rest.contains("stopped"), "{rest}");
+    assert_eq!(sockets(), 0, "control socket removed on exit");
+}
+
+/// Runs `webx4r reload --config <config>`.
+fn reload(config: &Path) -> (Option<i32>, String) {
+    let output = webx4r(&["reload"], config).output().unwrap();
+    (output.status.code(), String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+#[test]
+fn reload_command_applies_the_config_file() {
+    let (dir, config) = site();
+    fs::create_dir(dir.path().join("www2")).unwrap();
+    fs::write(dir.path().join("www2/index.html"), "reloaded site").unwrap();
+    let (mut child, mut stderr) = serve(&config);
+    let addr = listening_addr(&mut stderr, "http").0;
+
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(&config, text.replace("\"www\"", "\"www2\"")).unwrap();
+    let (applied, applied_log) = reload(&config);
+    let reloaded = get(&addr);
+
+    // Valid to parse, so only the server can tell it's wrong.
+    fs::write(&config, text.replace("\"www\"", "\"missing\"")).unwrap();
+    let (refused, refused_log) = reload(&config);
+    let kept = get(&addr);
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    assert_eq!(applied, Some(0), "{applied_log}");
+    assert!(applied_log.contains("reloaded"), "{applied_log}");
+    assert!(reloaded.ends_with("reloaded site"), "{reloaded}");
+    assert_eq!(refused, Some(1), "{refused_log}");
+    assert!(refused_log.contains("reload failed: site 1: can't open root"), "{refused_log}");
+    assert!(kept.ends_with("reloaded site"), "a failed reload keeps the old config: {kept}");
+}
+
+#[test]
+fn reload_without_a_server_says_so() {
+    let (_dir, config) = site();
+    let (code, log) = reload(&config);
+    assert_eq!(code, Some(1));
+    assert!(log.contains("is it running?"), "{log}");
 }
 
 #[test]

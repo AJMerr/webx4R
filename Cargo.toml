@@ -12,6 +12,7 @@ publish = false
 [workspace.dependencies]
 webxlib = { path = "crates/webxlib" }
 webxcore = { path = "crates/webxcore" }
+arc-swap = "1.9.3"
 bytes = "1.12.1"
 cap-fs-ext = "4.0.3"
 cap-std = "4.0.3"

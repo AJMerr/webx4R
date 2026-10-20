@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use http::header::HOST;
 use http::uri::Authority;
 use http::{Method, Request, Response, StatusCode, Version};
@@ -26,9 +27,9 @@ use webxlib::body::Body;
 use webxlib::pages;
 use webxlib::static_files::StaticFiles;
 
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::proxy::{self, Peer, Route};
-use crate::tls;
+use crate::tls::CertStore;
 
 /// How long shutdown waits for in-flight requests before dropping them.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -44,7 +45,41 @@ type ConnBuilder = auto::Builder<TokioExecutor>;
 pub struct Server {
     http: Option<Listener>,
     https: Option<Listener>,
-    router: Arc<Router>,
+    reloader: Reloader,
+}
+
+/// Applies a new config to a running [`Server`].
+#[derive(Clone)]
+pub struct Reloader {
+    /// Loaded once per request, so in-flight requests keep the config they started with.
+    router: Arc<ArcSwap<Router>>,
+    /// Outlives reloads, so connections to unchanged upstreams stay pooled.
+    client: proxy::Client,
+    /// Present when serving HTTPS.
+    certs: Option<Arc<CertStore>>,
+    /// The `[server]` table, which only a restart can change.
+    server: config::Server,
+}
+
+impl Reloader {
+    /// Builds the new config's sites and certificates, then swaps them in;
+    /// on error, the old config stays.
+    pub fn reload(&self, config: &Config) -> io::Result<()> {
+        if config.server != self.server {
+            let msg = "[server] settings changed; restart to apply them";
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, msg));
+        }
+        let router = Router::new(config, self.client.clone())?;
+        let certs = match &self.certs {
+            Some(store) => Some((store, store.load(config)?)),
+            None => None,
+        };
+        self.router.store(Arc::new(router));
+        if let Some((store, certs)) = certs {
+            store.store(certs);
+        }
+        Ok(())
+    }
 }
 
 /// A bound socket; the HTTPS one carries its TLS acceptor.
@@ -66,11 +101,19 @@ impl Listener {
 impl Server {
     /// Opens every site root and loads every cert, then binds the listeners.
     pub async fn bind(config: &Config) -> io::Result<Self> {
-        let router = Arc::new(Router::new(config)?);
-        let https = match config.server.https {
-            Some(addr) => Some((addr, TlsAcceptor::from(Arc::new(tls::server_config(config)?)))),
+        let client = proxy::Client::default();
+        let router = Arc::new(ArcSwap::from_pointee(Router::new(config, client.clone())?));
+        let certs = match config.server.https {
+            Some(_) => Some(Arc::new(CertStore::new(config)?)),
             None => None,
         };
+        let https = match (config.server.https, &certs) {
+            (Some(addr), Some(certs)) => {
+                Some((addr, TlsAcceptor::from(Arc::new(certs.server_config()))))
+            }
+            _ => None,
+        };
+        let reloader = Reloader { router, client, certs, server: config.server.clone() };
         let http = match config.server.http {
             Some(addr) => Some(Listener::bind(addr, None).await?),
             None => None,
@@ -79,7 +122,12 @@ impl Server {
             Some((addr, acceptor)) => Some(Listener::bind(addr, Some(acceptor)).await?),
             None => None,
         };
-        Ok(Self { http, https, router })
+        Ok(Self { http, https, reloader })
+    }
+
+    /// A handle for reloading the config while [`Server::run`] serves.
+    pub fn reloader(&self) -> Reloader {
+        self.reloader.clone()
     }
 
     pub fn http_addr(&self) -> Option<SocketAddr> {
@@ -137,7 +185,7 @@ impl Server {
 
             let conn = Connection {
                 peer: Peer { addr: peer, https: listener.tls.is_some() },
-                router: Arc::clone(&self.router),
+                router: Arc::clone(&self.reloader.router),
                 builder: Arc::clone(builder),
                 watcher: graceful.watcher(),
             };
@@ -160,7 +208,7 @@ impl Server {
 /// An accepted connection, served once any TLS handshake is done.
 struct Connection {
     peer: Peer,
-    router: Arc<Router>,
+    router: Arc<ArcSwap<Router>>,
     builder: Arc<ConnBuilder>,
     /// Held from accept, so shutdown also waits for handshakes in progress.
     watcher: Watcher,
@@ -173,7 +221,7 @@ impl Connection {
     {
         let Self { peer, router, builder, watcher } = self;
         let service = service_fn(move |req| {
-            let router = Arc::clone(&router);
+            let router = router.load_full();
             async move { Ok::<_, Infallible>(router.handle(req, peer).await) }
         });
         let conn = builder.serve_connection_with_upgrades(TokioIo::new(io), service);
@@ -199,7 +247,7 @@ struct SiteHandler {
 }
 
 impl Router {
-    fn new(config: &Config) -> io::Result<Self> {
+    fn new(config: &Config, client: proxy::Client) -> io::Result<Self> {
         let mut sites = HashMap::new();
         let mut default = None;
         for (i, site) in config.sites.iter().enumerate() {
@@ -220,7 +268,7 @@ impl Router {
                 default = Some(handler);
             }
         }
-        Ok(Self { sites, default, client: proxy::Client::default() })
+        Ok(Self { sites, default, client })
     }
 
     async fn handle(&self, req: Request<Incoming>, peer: Peer) -> Response<Body> {

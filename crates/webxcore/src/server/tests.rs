@@ -23,6 +23,9 @@ struct Running {
     https: Option<SocketAddr>,
     stop: Option<oneshot::Sender<()>>,
     done: tokio::task::JoinHandle<()>,
+    reloader: Reloader,
+    /// The config text the server started with.
+    config: String,
     dir: TempDir,
 }
 
@@ -54,24 +57,34 @@ impl Running {
         Self::start_with(dir, &text).await
     }
 
-    async fn start_with(dir: TempDir, config: &str) -> Self {
+    async fn start_with(dir: TempDir, text: &str) -> Self {
         for (name, body) in [("a", "site a"), ("b", "site b"), ("fallback", "fallback")] {
             fs::create_dir(dir.path().join(name)).unwrap();
             fs::write(dir.path().join(name).join("index.html"), body).unwrap();
         }
-        let config = Config::parse(config, dir.path()).unwrap();
+        let config = Config::parse(text, dir.path()).unwrap();
 
         let server = Server::bind(&config).await.unwrap();
         let (http, https) = (server.http_addr(), server.https_addr());
+        let reloader = server.reloader();
         let (stop, stopped) = oneshot::channel();
         let done = tokio::spawn(server.run(async {
             let _ = stopped.await;
         }));
-        Self { http, https, stop: Some(stop), done, dir }
+        Self { http, https, stop: Some(stop), done, reloader, config: text.to_owned(), dir }
+    }
+
+    /// Reloads with `config`, resolved against the same folder as the first one.
+    fn reload(&self, config: &str) -> io::Result<()> {
+        self.reloader.reload(&Config::parse(config, self.dir.path()).unwrap())
     }
 
     /// Opens a TLS connection with SNI `host`, offering `alpn` and trusting only that site's cert.
     async fn tls(&self, host: &str, alpn: &[u8]) -> TlsStream<TcpStream> {
+        self.try_tls(host, alpn).await.unwrap()
+    }
+
+    async fn try_tls(&self, host: &str, alpn: &[u8]) -> io::Result<TlsStream<TcpStream>> {
         let cert = self.dir.path().join(format!("{host}.crt"));
         let mut roots = rustls::RootCertStore::empty();
         roots.add(CertificateDer::from_pem_file(cert).unwrap()).unwrap();
@@ -85,7 +98,7 @@ impl Running {
 
         let tcp = TcpStream::connect(self.https.unwrap()).await.unwrap();
         let name = ServerName::try_from(host.to_owned()).unwrap();
-        TlsConnector::from(Arc::new(config)).connect(name, tcp).await.unwrap()
+        TlsConnector::from(Arc::new(config)).connect(name, tcp).await
     }
 
     /// Sends a raw HTTP/1.1 request and returns the whole response as text.
@@ -306,6 +319,74 @@ async fn unreachable_upstream_gets_a_502_page() {
     let built_in = server.get("c.test").await;
     assert!(built_in.starts_with("HTTP/1.1 502 Bad Gateway"), "{built_in}");
     assert!(built_in.contains("upstream server"), "{built_in}");
+    server.stop().await;
+}
+
+const SITE_A_IN: &str = "[server]\nhttp = \"127.0.0.1:0\"\n[[site]]\nhosts = [\"a.test\"]\nroot = ";
+
+#[tokio::test]
+async fn reload_swaps_sites() {
+    let server = Running::start(false).await;
+    server.reload(&format!("{SITE_A_IN}\"b\"\n")).unwrap();
+    assert!(server.get("a.test").await.ends_with("site b"), "a.test now serves b's root");
+    let removed = server.get("b.test").await;
+    assert!(removed.starts_with("HTTP/1.1 421"), "b.test is gone: {removed}");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn reload_applies_to_open_keep_alive_connections() {
+    let server = Running::start(false).await;
+    let stream = TcpStream::connect(server.http.unwrap()).await.unwrap();
+    let (mut sender, conn) =
+        hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.unwrap();
+    tokio::spawn(conn);
+    let get = || Request::get("/").header(HOST, "a.test").body(Empty::<Bytes>::new()).unwrap();
+
+    let before = sender.send_request(get()).await.unwrap();
+    assert_eq!(before.into_body().collect().await.unwrap().to_bytes(), "site a");
+    server.reload(&format!("{SITE_A_IN}\"b\"\n")).unwrap();
+    let after = sender.send_request(get()).await.unwrap();
+    assert_eq!(after.into_body().collect().await.unwrap().to_bytes(), "site b");
+    drop(sender);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn failed_reload_keeps_the_old_config() {
+    let server = Running::start(false).await;
+    let err = server.reload(&format!("{SITE_A_IN}\"missing\"\n")).unwrap_err();
+    assert!(err.to_string().starts_with("site 1: can't open root"), "{err}");
+    assert!(server.get("b.test").await.ends_with("site b"));
+
+    let moved = format!("{SITE_A_IN}\"b\"\n").replace("127.0.0.1:0", "127.0.0.1:1");
+    let err = server.reload(&moved).unwrap_err();
+    assert_eq!(err.to_string(), "[server] settings changed; restart to apply them");
+    assert!(server.get("b.test").await.ends_with("site b"));
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn reload_serves_renewed_certificates() {
+    let server = Running::start_tls(false).await;
+    // Replaces a.test's files; until a reload, the server still has the old cert.
+    write_pair(server.dir.path(), "a.test");
+    assert!(server.try_tls("a.test", b"h2").await.is_err(), "old cert isn't trusted");
+
+    server.reload(&server.config).unwrap();
+    let (_, body) = get_tls(server.tls("a.test", b"h2").await, "a.test").await;
+    assert_eq!(body, "site a");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn bad_certificate_fails_the_whole_reload() {
+    let server = Running::start_tls(true).await;
+    fs::write(server.dir.path().join("b.test.crt"), "").unwrap();
+    let swapped_roots = server.config.replace("root = \"a\"", "root = \"b\"");
+    let err = server.reload(&swapped_roots).unwrap_err();
+    assert!(err.to_string().ends_with("no certificates found"), "{err}");
+    assert!(server.get("a.test").await.ends_with("site a"), "sites weren't swapped either");
     server.stop().await;
 }
 
