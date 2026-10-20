@@ -82,6 +82,14 @@ impl Reloader {
     /// Builds the new config's sites and certificates, then swaps them in;
     /// on error, the old config stays.
     pub fn reload(&self, config: &Config) -> io::Result<()> {
+        let result = self.apply(config);
+        if let Some(registry) = &self.registry {
+            registry.reloaded(result.is_ok());
+        }
+        result
+    }
+
+    fn apply(&self, config: &Config) -> io::Result<()> {
         let restart = |table| {
             let msg = format!("{table} settings changed; restart to apply them");
             Err(io::Error::new(io::ErrorKind::InvalidInput, msg))
@@ -241,6 +249,9 @@ impl Server {
         graceful: &GracefulShutdown,
     ) {
         let Some(listener) = listener else { return std::future::pending().await };
+        let name = if listener.tls.is_some() { "https" } else { "http" };
+        let metrics =
+            self.reloader.registry.as_ref().map(|registry| Arc::new(registry.listener(name)));
         loop {
             let (stream, peer) = match listener.tcp.accept().await {
                 Ok(accepted) => accepted,
@@ -262,10 +273,22 @@ impl Server {
                 builder: Arc::clone(builder),
                 watcher: graceful.watcher(),
             };
+            // Counted as open until the task below ends.
+            let open = metrics.as_ref().map(|metrics| metrics.accepted());
+            let metrics = metrics.clone();
             // The handshake runs in the connection's task so a slow client can't stall accepts.
             match listener.tls.clone() {
-                None => tokio::spawn(conn.serve(stream)),
+                None => tokio::spawn(async move {
+                    conn.serve(stream).await;
+                    drop(open);
+                }),
                 Some(acceptor) => tokio::spawn(async move {
+                    let _open = open;
+                    let failed = |timed_out| {
+                        if let Some(metrics) = &metrics {
+                            metrics.handshake_failed(timed_out);
+                        }
+                    };
                     let handshake = acceptor.accept(stream);
                     match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, handshake).await {
                         // The handshake is the whole TLS-ALPN-01 answer (RFC 8737 §3).
@@ -275,8 +298,14 @@ impl Server {
                             tracing::debug!(%peer, "answered a TLS-ALPN-01 challenge");
                         }
                         Ok(Ok(stream)) => conn.serve(stream).await,
-                        Ok(Err(e)) => tracing::debug!(%peer, error = %e, "TLS handshake failed"),
-                        Err(_) => tracing::debug!(%peer, "TLS handshake timed out"),
+                        Ok(Err(e)) => {
+                            failed(false);
+                            tracing::debug!(%peer, error = %e, "TLS handshake failed");
+                        }
+                        Err(_) => {
+                            failed(true);
+                            tracing::debug!(%peer, "TLS handshake timed out");
+                        }
                     }
                 }),
             };
