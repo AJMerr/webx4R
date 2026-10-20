@@ -1,4 +1,3 @@
-use std::convert::Infallible;
 use std::net::Ipv4Addr;
 
 use http_body_util::Full;
@@ -13,29 +12,55 @@ use super::*;
 const PEER: Peer =
     Peer { addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)), 5555), https: true };
 
-/// Starts an upstream that answers each request with its method, URI, headers and body.
+/// Starts an upstream that answers each request with its method, URI, headers and body,
+/// and names itself in `x-upstream`.
 pub(crate) async fn echo_upstream() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
+    let name = addr.clone();
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
+            let name = name.clone();
+            let service = service_fn(move |req| echo(req, name.clone()));
             let conn = hyper::server::conn::http1::Builder::new()
-                .serve_connection(TokioIo::new(stream), service_fn(echo));
+                .serve_connection(TokioIo::new(stream), service);
             tokio::spawn(conn);
         }
     });
     addr
 }
 
-async fn echo(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
+async fn echo(req: Request<Incoming>, name: String) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let mut text = format!("{} {}\n", req.method(), req.uri());
     for (name, value) in req.headers() {
         text.push_str(&format!("{name}: {}\n", value.to_str().unwrap()));
     }
     text.push_str(&String::from_utf8_lossy(&req.into_body().collect().await?.to_bytes()));
-    let res = Response::builder().header("keep-alive", "timeout=5").header("x-app", "echo");
+    let res = Response::builder()
+        .header("keep-alive", "timeout=5")
+        .header("x-app", "echo")
+        .header("x-upstream", name);
     Ok(res.body(Full::new(Bytes::from(text))).unwrap())
+}
+
+/// An address with nothing listening on it.
+async fn closed_port() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    listener.local_addr().unwrap().to_string()
+}
+
+/// An upstream that accepts connections and never answers.
+async fn silent_upstream() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            held.push(listener.accept().await.unwrap());
+        }
+    });
+    addr
 }
 
 /// Forwards `req` through a fresh client and returns the response with its body as text.
@@ -103,9 +128,7 @@ async fn removes_hop_by_hop_headers() {
 
 #[tokio::test]
 async fn refused_connection_is_a_bad_gateway() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream = listener.local_addr().unwrap().to_string();
-    drop(listener);
+    let upstream = closed_port().await;
     let req = get("/").body(Full::default()).unwrap();
     let err = Client::default().forward(req, &upstream, PEER).await.err().unwrap();
     assert!(matches!(err, ProxyError::Connect(_)), "{err:?}");
@@ -129,13 +152,7 @@ async fn closed_connection_is_a_bad_gateway() {
 
 #[tokio::test]
 async fn slow_upstream_is_a_gateway_timeout() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let upstream = listener.local_addr().unwrap().to_string();
-    // Accepts, then never answers.
-    tokio::spawn(async move {
-        let _held = listener.accept().await.unwrap();
-        std::future::pending::<Infallible>().await
-    });
+    let upstream = silent_upstream().await;
     let client = Client { response_timeout: Duration::from_millis(100), ..Client::default() };
     let req = get("/").body(Full::default()).unwrap();
     let err = client.forward(req, &upstream, PEER).await.err().unwrap();
@@ -173,4 +190,73 @@ async fn path_less_requests_are_rejected() {
     let req = Request::options("*").body(Full::default()).unwrap();
     let err = Client::default().forward(req, "127.0.0.1:9", PEER).await.err().unwrap();
     assert!(matches!(err, ProxyError::BadRequest), "{err:?}");
+}
+
+/// A route for `/` over `upstreams`.
+fn balanced(upstreams: &[&String]) -> Route {
+    Route::new(&config::Proxy {
+        path: "/".to_owned(),
+        upstreams: upstreams.iter().map(|u| u.to_string()).collect(),
+        strip_prefix: false,
+    })
+}
+
+/// Sends `req` through `route` and returns the `x-upstream` that answered.
+async fn answered_by(route: &Route, client: &Client, req: Request<Full<Bytes>>) -> String {
+    let res = route.forward(client, req, PEER).await.map_err(|e| e.to_string()).unwrap();
+    res.headers()["x-upstream"].to_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn round_robin_across_upstreams() {
+    let (a, b) = (echo_upstream().await, echo_upstream().await);
+    let route = balanced(&[&a, &b]);
+    let client = Client::default();
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        seen.push(answered_by(&route, &client, get("/").body(Full::default()).unwrap()).await);
+    }
+    assert_eq!(seen, [a.as_str(), &b, &a, &b]);
+}
+
+#[tokio::test]
+async fn refused_upstream_is_retried_elsewhere_and_marked_down() {
+    let (down, up) = (closed_port().await, echo_upstream().await);
+    let route = balanced(&[&down, &up]);
+    let client = Client::default();
+
+    // The first request starts at `down`; its body must survive the failed attempt.
+    let req = Request::post("/").header(HOST, "a.test").body(Full::from("payload")).unwrap();
+    let res = route.forward(&client, req, PEER).await.map_err(|e| e.to_string()).unwrap();
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    assert!(body.ends_with(b"\npayload"), "{body:?}");
+    assert!(!route.upstreams[0].is_up(route.now()), "a refused upstream is marked down");
+
+    // While it's down, rotation skips it.
+    for _ in 0..3 {
+        let req = get("/").body(Full::default()).unwrap();
+        assert_eq!(answered_by(&route, &client, req).await, up);
+    }
+}
+
+#[tokio::test]
+async fn upstreams_marked_down_are_still_tried_last() {
+    let up = echo_upstream().await;
+    let route = balanced(&[&up]);
+    route.upstreams[0].mark_down(route.now());
+    let req = get("/").body(Full::default()).unwrap();
+    assert_eq!(answered_by(&route, &Client::default(), req).await, up);
+    assert!(route.upstreams[0].is_up(route.now()), "a success marks it up again");
+}
+
+#[tokio::test]
+async fn timeouts_mark_down_without_retrying() {
+    let (silent, up) = (silent_upstream().await, echo_upstream().await);
+    let route = balanced(&[&silent, &up]);
+    let client = Client { response_timeout: Duration::from_millis(100), ..Client::default() };
+    let req = get("/").body(Full::default()).unwrap();
+    // The silent upstream may have acted on the request, so it isn't sent again.
+    let err = route.forward(&client, req, PEER).await.err().unwrap();
+    assert!(matches!(err, ProxyError::Timeout), "{err:?}");
+    assert!(!route.upstreams[0].is_up(route.now()));
 }

@@ -2,14 +2,20 @@
 
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::header::{CONNECTION, HOST, TE, TRANSFER_ENCODING, UPGRADE};
+use http::request::Parts;
 use http::uri::PathAndQuery;
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, Uri, Version};
 use http_body_util::BodyExt;
 use http_body_util::combinators::UnsyncBoxBody;
+use hyper::body::{Frame, SizeHint};
 use hyper_util::client::legacy;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
@@ -22,6 +28,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long an upstream gets to send its response headers; bodies may stream for longer.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long an upstream is skipped after it fails to connect or respond in time.
+const FAIL_TIMEOUT: Duration = Duration::from_secs(10);
 
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const X_FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
@@ -114,31 +123,29 @@ impl Client {
         B: hyper::body::Body<Data = Bytes> + Send + 'static,
         B::Error: Into<BoxError>,
     {
-        let (mut parts, body) = req.into_parts();
-        let path = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or_default();
-        if !path.starts_with('/') {
-            return Err(ProxyError::BadRequest);
-        }
-        // HTTP/2 clients send the host in the URI, HTTP/1.1 clients in `Host`.
-        let host = match parts.uri.authority() {
-            Some(authority) => HeaderValue::from_str(authority.as_str()).ok(),
-            None => parts.headers.get(HOST).cloned(),
-        };
-        parts.uri = Uri::try_from(format!("http://{upstream}{path}"))
+        let (head, body) = prepare(req, peer)?;
+        self.send(&head, body, upstream).await
+    }
+
+    /// Sends a request made by [`prepare`] to `upstream`.
+    async fn send<B>(
+        &self,
+        head: &Parts,
+        body: B,
+        upstream: &str,
+    ) -> Result<Response<Body>, ProxyError>
+    where
+        B: hyper::body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<BoxError>,
+    {
+        let path = head.uri.path_and_query().map_or("/", PathAndQuery::as_str);
+        let mut req = Request::new(body.map_err(Into::into).boxed_unsync());
+        *req.method_mut() = head.method.clone();
+        *req.uri_mut() = Uri::try_from(format!("http://{upstream}{path}"))
             .map_err(|_| ProxyError::BadRequest)?;
-        parts.version = Version::HTTP_11;
+        *req.version_mut() = Version::HTTP_11;
+        *req.headers_mut() = head.headers.clone();
 
-        let headers = &mut parts.headers;
-        remove_hop_by_hop(headers);
-        if let Some(host) = host {
-            headers.insert(HOST, host.clone());
-            headers.insert(X_FORWARDED_HOST, host);
-        }
-        append_forwarded_for(headers, peer.addr.ip().to_canonical());
-        let proto = HeaderValue::from_static(if peer.https { "https" } else { "http" });
-        headers.insert(X_FORWARDED_PROTO, proto);
-
-        let req = Request::from_parts(parts, body.map_err(Into::into).boxed_unsync());
         let res = match tokio::time::timeout(self.response_timeout, self.inner.request(req)).await {
             Ok(Ok(res)) => res,
             Ok(Err(e)) if e.is_connect() => return Err(ProxyError::Connect(e)),
@@ -154,19 +161,77 @@ impl Client {
     }
 }
 
-/// A site's `[[site.proxy]]`: requests at or below `prefix` go to its upstreams.
+/// Checks that `req` has a path to forward and rewrites its headers for an upstream.
+/// The URI is addressed to each upstream in [`Client::send`].
+fn prepare<B>(req: Request<B>, peer: Peer) -> Result<(Parts, B), ProxyError> {
+    let (mut parts, body) = req.into_parts();
+    if !parts.uri.path_and_query().is_some_and(|p| p.as_str().starts_with('/')) {
+        return Err(ProxyError::BadRequest);
+    }
+    // HTTP/2 clients send the host in the URI, HTTP/1.1 clients in `Host`.
+    let host = match parts.uri.authority() {
+        Some(authority) => HeaderValue::from_str(authority.as_str()).ok(),
+        None => parts.headers.get(HOST).cloned(),
+    };
+
+    let headers = &mut parts.headers;
+    remove_hop_by_hop(headers);
+    if let Some(host) = host {
+        headers.insert(HOST, host.clone());
+        headers.insert(X_FORWARDED_HOST, host);
+    }
+    append_forwarded_for(headers, peer.addr.ip().to_canonical());
+    let proto = HeaderValue::from_static(if peer.https { "https" } else { "http" });
+    headers.insert(X_FORWARDED_PROTO, proto);
+    Ok((parts, body))
+}
+
+/// A site's `[[site.proxy]]`: requests at or below `prefix` go to its upstreams in turn.
 pub struct Route {
     prefix: String,
-    upstreams: Vec<String>,
+    upstreams: Vec<Upstream>,
     strip_prefix: bool,
+    /// Round-robin counter.
+    next: AtomicUsize,
+    /// Zero point for [`Upstream::down_until`].
+    epoch: Instant,
+}
+
+struct Upstream {
+    addr: String,
+    /// Milliseconds after the route's epoch until which this upstream is skipped; 0 when up.
+    down_until: AtomicU64,
+}
+
+impl Upstream {
+    fn is_up(&self, now: u64) -> bool {
+        self.down_until.load(Ordering::Relaxed) <= now
+    }
+
+    fn mark_down(&self, now: u64) {
+        self.down_until.store(now + FAIL_TIMEOUT.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn mark_up(&self) {
+        // Load first, so healthy upstreams don't take a write on every request.
+        if self.down_until.load(Ordering::Relaxed) != 0 {
+            self.down_until.store(0, Ordering::Relaxed);
+        }
+    }
 }
 
 impl Route {
     pub fn new(config: &config::Proxy) -> Self {
+        let upstreams = config
+            .upstreams
+            .iter()
+            .map(|addr| Upstream { addr: addr.clone(), down_until: AtomicU64::new(0) });
         Self {
             prefix: config.path.clone(),
-            upstreams: config.upstreams.clone(),
+            upstreams: upstreams.collect(),
             strip_prefix: config.strip_prefix,
+            next: AtomicUsize::new(0),
+            epoch: Instant::now(),
         }
     }
 
@@ -180,7 +245,8 @@ impl Route {
             .is_some_and(|rest| self.prefix == "/" || rest.is_empty() || rest.starts_with('/'))
     }
 
-    /// Forwards `req` to an upstream, without the prefix if `strip_prefix` is set.
+    /// Forwards `req` to the next healthy upstream, without the prefix if `strip_prefix` is set.
+    /// If connecting fails, the request was never sent, so the next upstream gets it.
     pub async fn forward<B>(
         &self,
         client: &Client,
@@ -188,19 +254,99 @@ impl Route {
         peer: Peer,
     ) -> Result<Response<Body>, ProxyError>
     where
-        B: hyper::body::Body<Data = Bytes> + Send + 'static,
+        B: hyper::body::Body<Data = Bytes> + Send + Unpin + 'static,
         B::Error: Into<BoxError>,
     {
         if self.strip_prefix && self.prefix != "/" {
             *req.uri_mut() = strip_prefix(req.uri(), &self.prefix)?;
         }
-        let upstream = &self.upstreams[0];
-        let result = client.forward(req, upstream, peer).await;
-        if let Err(e) = &result {
-            tracing::warn!(%upstream, client = %peer.addr, error = %e, "proxy request failed");
+        let (head, body) = prepare(req, peer)?;
+        let slot = Arc::new(Mutex::new(Some(body)));
+
+        let mut last_error = None;
+        for upstream in self.candidates() {
+            let body = Reclaimable { slot: Arc::clone(&slot), body: None };
+            let error = match client.send(&head, body, &upstream.addr).await {
+                Ok(res) => {
+                    upstream.mark_up();
+                    return Ok(res);
+                }
+                Err(e) => e,
+            };
+            tracing::warn!(upstream = %upstream.addr, client = %peer.addr, %error, "proxy request failed");
+            if matches!(error, ProxyError::Connect(_) | ProxyError::Timeout) {
+                upstream.mark_down(self.now());
+            }
+            let retry = matches!(error, ProxyError::Connect(_)) && lock(&slot).is_some();
+            if !retry {
+                return Err(error);
+            }
+            last_error = Some(error);
         }
-        result
+        Err(last_error.expect("config validation requires at least one upstream"))
     }
+
+    /// Every upstream, starting at the next in rotation: those that are up, then those marked
+    /// down as a last resort.
+    fn candidates(&self) -> Vec<&Upstream> {
+        let n = self.upstreams.len();
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        let mut order: Vec<_> = (0..n).map(|i| &self.upstreams[(start + i) % n]).collect();
+        let now = self.now();
+        // A stable sort keeps the rotation order within each group.
+        order.sort_by_key(|upstream| !upstream.is_up(now));
+        order
+    }
+
+    fn now(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+}
+
+/// A request body that stays in `slot` until an upstream first reads it, so a request whose
+/// connection failed can be sent again.
+struct Reclaimable<B> {
+    slot: Arc<Mutex<Option<B>>>,
+    /// Moved out of `slot` on the first read.
+    body: Option<B>,
+}
+
+impl<B: hyper::body::Body + Unpin> hyper::body::Body for Reclaimable<B> {
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<B::Data>, B::Error>>> {
+        let this = self.get_mut();
+        if this.body.is_none() {
+            this.body = lock(&this.slot).take();
+        }
+        match &mut this.body {
+            Some(body) => Pin::new(body).poll_frame(cx),
+            None => Poll::Ready(None),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match &self.body {
+            Some(body) => body.is_end_stream(),
+            None => lock(&self.slot).as_ref().is_none_or(|body| body.is_end_stream()),
+        }
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        match &self.body {
+            Some(body) => body.size_hint(),
+            None => lock(&self.slot).as_ref().map_or(SizeHint::with_exact(0), |b| b.size_hint()),
+        }
+    }
+}
+
+/// Locks `mutex`, ignoring poisoning: the data is an `Option` that a panic can't leave half-set.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// `/api/x?q` without `/api` is `/x?q`; the prefix alone becomes `/`.
