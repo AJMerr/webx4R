@@ -254,8 +254,12 @@ pub struct Route {
     epoch: Instant,
 }
 
+/// A response extension naming the upstream that answered, for the access log.
+#[derive(Debug, Clone)]
+pub struct Answered(pub Arc<str>);
+
 struct Upstream {
-    addr: String,
+    addr: Arc<str>,
     /// Milliseconds after the route's epoch until which this upstream is skipped; 0 when up.
     down_until: AtomicU64,
 }
@@ -282,7 +286,7 @@ impl Route {
         let upstreams = config
             .upstreams
             .iter()
-            .map(|addr| Upstream { addr: addr.clone(), down_until: AtomicU64::new(0) });
+            .map(|addr| Upstream { addr: addr.as_str().into(), down_until: AtomicU64::new(0) });
         Self {
             prefix: config.path.clone(),
             upstreams: upstreams.collect(),
@@ -324,8 +328,9 @@ impl Route {
         for upstream in self.candidates() {
             let body = Reclaimable { slot: Arc::clone(&slot), body: None };
             let error = match client.send(&head, body, &upstream.addr).await {
-                Ok(res) => {
+                Ok(mut res) => {
                     upstream.mark_up();
+                    res.extensions_mut().insert(Answered(Arc::clone(&upstream.addr)));
                     return Ok(res);
                 }
                 Err(e) => e,

@@ -1,11 +1,13 @@
 use std::fs;
 use std::net::SocketAddr;
+use std::sync::Mutex;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Empty};
 use hyper_util::rt::TokioExecutor;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
+use serde_json::json;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -27,6 +29,8 @@ struct Running {
     done: tokio::task::JoinHandle<()>,
     reloader: Reloader,
     challenges: Option<Arc<Challenges>>,
+    /// Every access log entry so far, in JSON.
+    access: Arc<Mutex<Vec<serde_json::Value>>>,
     /// The config text the server started with.
     config: String,
     dir: TempDir,
@@ -73,7 +77,12 @@ impl Running {
         }
         let config = Config::parse(text, dir.path()).unwrap();
 
-        let server = Server::bind(&config).await.unwrap();
+        let mut server = Server::bind(&config).await.unwrap();
+        let access = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&access);
+        server.set_access_log(AccessLog::new(config::AccessFormat::Json, move |line| {
+            sink.lock().unwrap().push(serde_json::from_slice(line).unwrap());
+        }));
         let (http, https) = (server.http_addr(), server.https_addr());
         let reloader = server.reloader();
         let challenges = server.challenges.clone();
@@ -82,7 +91,22 @@ impl Running {
             let _ = stopped.await;
         }));
         let config = text.to_owned();
-        Self { http, https, stop: Some(stop), done, reloader, challenges, config, dir }
+        Self { http, https, stop: Some(stop), done, reloader, challenges, access, config, dir }
+    }
+
+    /// The first `n` access log entries, waiting briefly: an entry is written when its body
+    /// is dropped, which can come just after the client has the whole response.
+    async fn access_entries(&self, n: usize) -> Vec<serde_json::Value> {
+        for _ in 0..100 {
+            {
+                let entries = self.access.lock().unwrap();
+                if entries.len() >= n {
+                    return entries[..n].to_vec();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("fewer than {n} entries: {:?}", self.access.lock().unwrap());
     }
 
     /// Reloads with `config`, resolved against the same folder as the first one.
@@ -257,6 +281,32 @@ async fn routes_paths_to_proxies_and_static_files() {
     assert!(body(server.get_path("a.test", "/api/v2").await).starts_with("GET /\n"));
     let other = server.get_path("a.test", "/apix").await;
     assert!(other.starts_with("HTTP/1.1 404"), "not a proxy path: {other}");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn access_log_records_files_proxied_and_redirected_responses() {
+    let upstream = echo_upstream().await;
+    // Joins the last site, b.test.
+    let sites = format!("[[site.proxy]]\npath = \"/\"\nupstreams = [\"{upstream}\"]\n");
+    let server = Running::start_tls_with(true, &sites).await;
+    let (_, body) = get_tls(server.tls("a.test", b"h2").await, "a.test").await;
+    assert_eq!(body, "site a");
+    let echoed = get_tls(server.tls("b.test", b"http/1.1").await, "b.test").await.1;
+    let redirect = server.get_path("a.test", "/old?x=1").await;
+    assert!(redirect.starts_with("HTTP/1.1 308"), "{redirect}");
+
+    let entries = server.access_entries(3).await;
+    let find = |uri: &str| entries.iter().find(|entry| entry["uri"] == uri).unwrap();
+    let file = find("/");
+    assert_eq!((&file["host"], &file["protocol"]), (&json!("a.test"), &json!("HTTP/2.0")));
+    assert_eq!((&file["status"], &file["bytes"]), (&json!(200), &json!(6)));
+    assert_eq!(file["client"], "127.0.0.1");
+    let proxied = &entries.iter().find(|entry| entry["host"] == "b.test").unwrap();
+    assert_eq!(proxied["upstream"], upstream.as_str(), "{proxied}");
+    assert_eq!(proxied["bytes"], echoed.len());
+    let redirected = find("/old?x=1");
+    assert_eq!((&redirected["status"], &redirected["bytes"]), (&json!(308), &json!(0)));
     server.stop().await;
 }
 

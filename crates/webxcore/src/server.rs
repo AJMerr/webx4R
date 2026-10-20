@@ -27,6 +27,7 @@ use webxlib::body::Body;
 use webxlib::pages;
 use webxlib::static_files::StaticFiles;
 
+use crate::access_log::{AccessLog, Logged, Started};
 use crate::acme::{self, ACME_TLS_ALPN, Challenges};
 use crate::config::{self, Config};
 use crate::proxy::{self, Peer, Route};
@@ -50,6 +51,7 @@ pub struct Server {
     /// Present with `[acme]`, like `manager`.
     challenges: Option<Arc<Challenges>>,
     manager: Option<acme::Manager>,
+    access_log: Option<Arc<AccessLog>>,
 }
 
 /// Applies a new config to a running [`Server`].
@@ -166,7 +168,12 @@ impl Server {
             manager: handle,
             https_port,
         };
-        Ok(Self { http, https, reloader, challenges, manager })
+        Ok(Self { http, https, reloader, challenges, manager, access_log: None })
+    }
+
+    /// Records every response in `log` from now on.
+    pub fn set_access_log(&mut self, log: AccessLog) {
+        self.access_log = Some(Arc::new(log));
     }
 
     /// A handle for reloading the config while [`Server::run`] serves.
@@ -239,6 +246,7 @@ impl Server {
                 peer: Peer { addr: peer, https: listener.tls.is_some() },
                 router: Arc::clone(&self.reloader.router),
                 challenges: self.challenges.clone(),
+                access_log: self.access_log.clone(),
                 builder: Arc::clone(builder),
                 watcher: graceful.watcher(),
             };
@@ -269,6 +277,7 @@ struct Connection {
     peer: Peer,
     router: Arc<ArcSwap<Router>>,
     challenges: Option<Arc<Challenges>>,
+    access_log: Option<Arc<AccessLog>>,
     builder: Arc<ConnBuilder>,
     /// Held from accept, so shutdown also waits for handshakes in progress.
     watcher: Watcher,
@@ -279,14 +288,21 @@ impl Connection {
     where
         I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let Self { peer, router, challenges, builder, watcher } = self;
+        let Self { peer, router, challenges, access_log, builder, watcher } = self;
         let service = service_fn(move |req| {
+            let logging = access_log
+                .as_ref()
+                .map(|log| (Arc::clone(log), Started::new(&req, peer.addr.ip())));
             let answer = challenges.as_ref().and_then(|challenges| challenges.http_response(&req));
             let router = router.load_full();
             async move {
-                Ok::<_, Infallible>(match answer {
+                let res = match answer {
                     Some(res) => res,
                     None => router.handle(req, peer).await,
+                };
+                Ok::<_, Infallible>(match logging {
+                    Some((log, started)) => Logged::wrap(log, started, res),
+                    None => res.map(Logged::unlogged),
                 })
             }
         });
