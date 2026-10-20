@@ -8,10 +8,12 @@ use std::process::{Child, ChildStderr, Command, Stdio};
 
 use tempfile::TempDir;
 
-/// A temp folder with `www/index.html` and a `webx4r.toml` serving it on a random port.
+/// A temp folder with `www/index.html`, a `run` folder for control sockets, and a
+/// `webx4r.toml` serving `www` on a random port.
 fn site() -> (TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir(dir.path().join("www")).unwrap();
+    fs::create_dir(dir.path().join("run")).unwrap();
     fs::write(dir.path().join("www/index.html"), "hello from webx4r").unwrap();
     let config = dir.path().join("webx4r.toml");
     let text = "[server]\nhttp = \"127.0.0.1:0\"\n[[site]]\nroot = \"www\"\ndefault = true\n";
@@ -19,14 +21,16 @@ fn site() -> (TempDir, PathBuf) {
     (dir, config)
 }
 
+/// `webx4r <args> --config <config>`, with the control socket in the site's `run` folder.
+fn webx4r(args: &[&str], config: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_webx4r"));
+    command.args(args).arg("--config").arg(config);
+    command.env("XDG_RUNTIME_DIR", config.parent().unwrap().join("run"));
+    command
+}
+
 fn serve(config: &Path) -> (Child, BufReader<ChildStderr>) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_webx4r"))
-        .arg("serve")
-        .arg("--config")
-        .arg(config)
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = webx4r(&["serve"], config).stderr(Stdio::piped()).spawn().unwrap();
     let stderr = BufReader::new(child.stderr.take().unwrap());
     (child, stderr)
 }
@@ -175,7 +179,8 @@ fn sigterm_shuts_down_cleanly() {
     let (dir, config) = site();
     let (mut child, mut stderr) = serve(&config);
     listening_addr(&mut stderr, "http");
-    assert!(dir.path().join("webx4r.sock").exists(), "control socket next to the config");
+    let sockets = || fs::read_dir(dir.path().join("run")).unwrap().count();
+    assert_eq!(sockets(), 1, "control socket in $XDG_RUNTIME_DIR");
 
     send_signal(&child, "TERM");
     let status = child.wait().unwrap();
@@ -183,16 +188,12 @@ fn sigterm_shuts_down_cleanly() {
     stderr.read_to_string(&mut rest).unwrap();
     assert!(status.success(), "{status}: {rest}");
     assert!(rest.contains("shutting down") && rest.contains("stopped"), "{rest}");
-    assert!(!dir.path().join("webx4r.sock").exists(), "control socket removed on exit");
+    assert_eq!(sockets(), 0, "control socket removed on exit");
 }
 
 /// Runs `webx4r reload --config <config>`.
 fn reload(config: &Path) -> (Option<i32>, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_webx4r"))
-        .args(["reload", "--config"])
-        .arg(config)
-        .output()
-        .unwrap();
+    let output = webx4r(&["reload"], config).output().unwrap();
     (output.status.code(), String::from_utf8_lossy(&output.stderr).into_owned())
 }
 

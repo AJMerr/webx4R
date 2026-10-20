@@ -56,7 +56,13 @@ impl ControlListener {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        let listener = tokio::net::UnixListener::bind(endpoint)?;
+        let listener = tokio::net::UnixListener::bind(endpoint).map_err(|e| match e.kind() {
+            // Most likely the path is too long for a socket.
+            io::ErrorKind::InvalidInput => {
+                io::Error::new(e.kind(), format!("{e}; set `[server] control` to a shorter path"))
+            }
+            _ => e,
+        })?;
         std::fs::set_permissions(endpoint, std::fs::Permissions::from_mode(0o600))?;
         Ok(Self { listener, endpoint: endpoint.to_owned() })
     }

@@ -95,6 +95,15 @@ async fn other_files_are_left_alone() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn too_long_paths_suggest_a_shorter_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = dir.path().join("x".repeat(120));
+    let err = ControlListener::bind(&endpoint).err().unwrap();
+    assert!(err.to_string().ends_with("set `[server] control` to a shorter path"), "{err}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn socket_is_private_and_removed_on_drop() {
     use std::os::unix::fs::PermissionsExt;
 

@@ -14,9 +14,10 @@ Early development; there are no releases yet. What works now:
 - Range requests, including multiple ranges in one request
 - Optional directory listings
 - Built-in error pages that a site can replace with its own
+- Config reload without downtime, with `webx4r reload` or SIGHUP on Unix
 - Graceful shutdown on Ctrl-C, or SIGTERM on Unix
 
-Config reload, automatic certificates (ACME) and metrics are not built yet. They make up the rest of the first milestone.
+Automatic certificates (ACME) and metrics are not built yet. They make up the rest of the first milestone.
 
 Linux is the main target. Windows is supported and tested in CI.
 
@@ -67,8 +68,9 @@ Logs go to stderr at the `info` level. Set `WEBX4R_LOG=debug` for more detail.
 |---|---|
 | `http` | Address to listen on for plain HTTP, such as `0.0.0.0:8080`. |
 | `https` | Address to listen on for HTTPS, such as `0.0.0.0:8443`. |
+| `control` | Where `webx4r reload` reaches the server: a socket path on Unix, or a pipe name (`\\.\pipe\…`) on Windows. Optional; see [Reloading](#reloading) for the default. |
 
-At least one of the two is required.
+At least one of `http` and `https` is required.
 
 ### `[[site]]`
 
@@ -117,7 +119,21 @@ The app sees the client's `Host` header, plus `X-Forwarded-For`, `X-Forwarded-Ho
 
 Set `[server] https` and give each site a `cert` and `key`. The server offers HTTP/2 and HTTP/1.1 over TLS, and picks each connection's certificate from the hostname the client sends (SNI). A client that sends an unknown name, or none, gets the default site's certificate.
 
-A site without cert files gets a self-signed certificate for its `localhost` and `*.localhost` names, plus `127.0.0.1` and `::1`. It's made fresh at every start and never saved, so browsers warn about it each time. That's expected for local development.
+A site without cert files gets a self-signed certificate for its `localhost` and `*.localhost` names, plus `127.0.0.1` and `::1`. It's made fresh at every start and never saved, so browsers warn about it after each restart. A reload keeps it as long as the site's names stay the same. The warning is expected for local development.
+
+### Reloading
+
+Edit the config, then apply it without a restart:
+
+```sh
+./target/release/webx4r reload --config mysite/webx4r.toml
+```
+
+On Unix, `kill -HUP <pid>` (or systemd's `ExecReload`) does the same. The new config is checked first. If anything is wrong, the error is printed and the server keeps its current config. Requests already in progress finish on the old config; every new request uses the new one, including on keep-alive connections that are already open.
+
+Sites, proxy routes and certificates all reload, so renewed certificate files take effect too. Changes to `[server]` need a restart.
+
+`webx4r reload` reaches the server through a control socket that only its owner can use. On Unix it's `$XDG_RUNTIME_DIR/webx4r-<id>.sock`, named after the config's folder, or `webx4r.sock` next to the config when that variable isn't set. On Windows it's a named pipe. The server logs the location at startup. Set `[server] control` to choose it yourself.
 
 ## Development
 
