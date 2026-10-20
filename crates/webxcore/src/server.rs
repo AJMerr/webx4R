@@ -119,11 +119,6 @@ impl Listener {
 impl Server {
     /// Loads every cert, binds the listeners, then opens every site root.
     pub async fn bind(config: &Config) -> io::Result<Self> {
-        Self::bind_with(config, Arc::new(instant_acme::Account::builder)).await
-    }
-
-    /// Like [`Server::bind`], reaching the ACME server through `connector`.
-    pub(crate) async fn bind_with(config: &Config, connector: acme::Connector) -> io::Result<Self> {
         let challenges = config.acme.as_ref().map(|_| Arc::new(Challenges::default()));
         let certs = match config.server.https {
             Some(_) => Some(Arc::new(CertStore::new(config, challenges.clone())?)),
@@ -147,7 +142,7 @@ impl Server {
         let router = Arc::new(ArcSwap::from_pointee(router));
         let manager = match (&challenges, &certs) {
             (Some(challenges), Some(certs)) => {
-                acme::Manager::new(config, connector, Arc::clone(challenges), Arc::clone(certs))
+                acme::Manager::new(config, Arc::clone(challenges), Arc::clone(certs))?
             }
             _ => None,
         };

@@ -259,3 +259,58 @@ fn missing_config_exits_with_an_error() {
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr.contains("can't read /nonexistent/webx4r.toml"), "{stderr}");
 }
+
+// Shared with webxcore's tests; not every helper is used here.
+#[allow(dead_code)]
+#[path = "../../webxcore/src/acme/pebble.rs"]
+mod pebble;
+
+/// Waits until a file named `name` appears anywhere under `dir`.
+fn wait_for_file(dir: &Path, name: &str, pebble: &pebble::Pebble) -> PathBuf {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let mut folders = vec![dir.to_owned()];
+        while let Some(folder) = folders.pop() {
+            for entry in fs::read_dir(&folder).into_iter().flatten().map(Result::unwrap) {
+                if entry.file_name() == name {
+                    return entry.path();
+                }
+                folders.push(entry.path());
+            }
+        }
+        assert!(std::time::Instant::now() < deadline, "no {name}:\n{}", pebble.logs());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[test]
+#[ignore = "needs pebble on PATH"]
+fn gets_a_certificate_over_acme_and_redirects_to_https() {
+    let (dir, config) = site();
+    let (http, https) = (pebble::free_port(), pebble::free_port());
+    let pebble = pebble::Pebble::start_validating(http, https);
+    // Literal strings, so Windows paths' backslashes aren't escapes.
+    let text = format!(
+        "[server]\nhttp = \"127.0.0.1:{http}\"\nhttps = \"127.0.0.1:{https}\"\n\
+         [[site]]\nhosts = [\"example.test\"]\nroot = \"www\"\n\
+         [acme]\ndirectory = '{}'\nca_root = '{}'\nstorage = \"state\"\n",
+        pebble.url(),
+        pebble.root().display()
+    );
+    fs::write(&config, text).unwrap();
+    let (mut child, mut stderr) = serve(&config);
+    listening_addr(&mut stderr, "https");
+
+    let saved = wait_for_file(&dir.path().join("state"), "example.test.pem", &pebble);
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{http}")).unwrap();
+    let request = "GET /page?x=1 HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\n\r\n";
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut redirect = String::new();
+    stream.read_to_string(&mut redirect).unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    assert!(fs::read_to_string(saved).unwrap().contains("BEGIN CERTIFICATE"));
+    let location = format!("\r\nlocation: https://example.test:{https}/page?x=1\r\n");
+    assert!(redirect.starts_with("HTTP/1.1 308") && redirect.contains(&location), "{redirect}");
+}

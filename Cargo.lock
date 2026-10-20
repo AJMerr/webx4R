@@ -1661,6 +1661,8 @@ name = "webx4r"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "rcgen",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

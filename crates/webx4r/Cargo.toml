@@ -15,4 +15,7 @@ tracing-subscriber.workspace = true
 webxcore.workspace = true
 
 [dev-dependencies]
+# For the Pebble harness that the end-to-end tests share with webxcore.
+rcgen.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true

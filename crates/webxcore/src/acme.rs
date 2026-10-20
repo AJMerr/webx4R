@@ -3,9 +3,11 @@
 
 mod manager;
 #[cfg(test)]
-pub(crate) mod tests;
+pub(crate) mod pebble;
+#[cfg(test)]
+mod tests;
 
-pub use manager::{Connector, Handle, Manager};
+pub use manager::{Handle, Manager};
 
 use std::collections::HashMap;
 use std::fmt::Display;

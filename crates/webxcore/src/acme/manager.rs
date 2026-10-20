@@ -1,6 +1,7 @@
 //! Orders each `[acme]` site's certificate, then renews it before it expires.
 
 use std::collections::HashMap;
+use std::io;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -8,6 +9,8 @@ use instant_acme::{
     Account, AccountBuilder, AuthorizationStatus, ChallengeType, Identifier, NewOrder, Order,
     OrderStatus, RetryPolicy,
 };
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use tokio::sync::watch;
 
 use super::{Challenges, Issued, Storage, account};
@@ -16,8 +19,8 @@ use crate::tls::CertStore;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
-/// Makes the client that talks to the CA; tests swap in one that trusts Pebble.
-pub type Connector = Arc<dyn Fn() -> Result<AccountBuilder, instant_acme::Error> + Send + Sync>;
+/// Makes the client that talks to the CA.
+type Connector = Box<dyn Fn() -> Result<AccountBuilder, instant_acme::Error> + Send + Sync>;
 
 /// The wait after a first failed order; each further failure waits 3 times longer.
 /// Let's Encrypt allows 5 failed validations per name per hour.
@@ -67,19 +70,18 @@ impl Manager {
     /// `None` without `[acme]`. Serves the certs saved earlier right away.
     pub fn new(
         config: &Config,
-        connector: Connector,
         challenges: Arc<Challenges>,
         certs: Arc<CertStore>,
-    ) -> Option<(Self, Handle)> {
-        let acme = config.acme.clone()?;
+    ) -> io::Result<Option<(Self, Handle)>> {
+        let Some(acme) = config.acme.clone() else { return Ok(None) };
         let root = config.acme_storage();
         tracing::info!(storage = %root.display(), "ACME certificates are kept here");
         let storage = Storage::new(&root, acme.directory_url());
         let (sender, wanted) = watch::channel(self::wanted(config));
         let mut manager = Self {
+            connector: connector(&acme)?,
             acme,
             storage,
-            connector,
             challenges,
             certs,
             http: config.server.http.is_some(),
@@ -90,7 +92,7 @@ impl Manager {
         };
         let wanted = manager.wanted.borrow().clone();
         manager.load_saved(&wanted);
-        Some((manager, Handle(Arc::new(sender))))
+        Ok(Some((manager, Handle(Arc::new(sender)))))
     }
 
     /// Orders and renews certs until dropped.
@@ -189,6 +191,17 @@ impl Manager {
         let (key_pem, chain_pem) = order(&account, names, kind, &self.challenges).await?;
         Ok(self.storage.save_cert(names, &key_pem, &chain_pem)?)
     }
+}
+
+/// The system's roots, or only `ca_root`, which is checked now rather than at the first
+/// order.
+fn connector(acme: &Acme) -> io::Result<Connector> {
+    let Some(root) = acme.ca_root.clone() else { return Ok(Box::new(Account::builder)) };
+    CertificateDer::from_pem_file(&root).map_err(|e| {
+        let msg = format!("can't load [acme] ca_root {}: {e}", root.display());
+        io::Error::new(io::ErrorKind::InvalidData, msg)
+    })?;
+    Ok(Box::new(move || Account::builder_with_root(&root)))
 }
 
 /// The names each site needs an ACME cert for, skipping sites with none.
@@ -312,6 +325,14 @@ mod tests {
         assert_eq!(types, [ChallengeType::Http01, ChallengeType::TlsAlpn01, ChallengeType::Http01]);
         assert_eq!(challenge_type(false, 0), ChallengeType::TlsAlpn01, "no HTTP listener");
         assert_eq!(challenge_type(false, 1), ChallengeType::TlsAlpn01);
+    }
+
+    #[test]
+    fn unreadable_ca_root_fails_at_startup() {
+        let ca_root = Some(Path::new("/nonexistent/root.pem").to_owned());
+        let acme = Acme { email: None, directory: None, storage: None, ca_root };
+        let err = connector(&acme).err().unwrap().to_string();
+        assert!(err.starts_with("can't load [acme] ca_root /nonexistent/root.pem"), "{err}");
     }
 
     #[test]

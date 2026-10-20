@@ -15,7 +15,7 @@ use tokio_rustls::client::TlsStream;
 
 use super::*;
 use crate::acme::Storage;
-use crate::acme::tests::{Pebble, free_port};
+use crate::acme::pebble::{Pebble, free_port};
 use crate::proxy::tests::{echo_upstream, upgrade_upstream};
 use crate::tls::tests::write_pair;
 
@@ -67,18 +67,13 @@ impl Running {
     }
 
     async fn start_with(dir: TempDir, text: &str) -> Self {
-        Self::start_with_connector(dir, text, Arc::new(instant_acme::Account::builder)).await
-    }
-
-    /// Like [`Running::start_with`], reaching the ACME server through `connector`.
-    async fn start_with_connector(dir: TempDir, text: &str, connector: acme::Connector) -> Self {
         for (name, body) in [("a", "site a"), ("b", "site b"), ("fallback", "fallback")] {
             fs::create_dir(dir.path().join(name)).unwrap();
             fs::write(dir.path().join(name).join("index.html"), body).unwrap();
         }
         let config = Config::parse(text, dir.path()).unwrap();
 
-        let server = Server::bind_with(&config, connector).await.unwrap();
+        let server = Server::bind(&config).await.unwrap();
         let (http, https) = (server.http_addr(), server.https_addr());
         let reloader = server.reloader();
         let challenges = server.challenges.clone();
@@ -633,15 +628,17 @@ async fn start_with_pebble(with_http: bool) -> (Running, Pebble, Storage) {
     let (http, https) = (free_port(), free_port());
     let pebble = Pebble::start_validating(http, https);
     let http = if with_http { format!("http = \"127.0.0.1:{http}\"\n") } else { String::new() };
+    // Literal strings, so Windows paths' backslashes aren't escapes.
     let text = format!(
         "[server]\n{http}https = \"127.0.0.1:{https}\"\n\
          [[site]]\nhosts = [\"a.test\", \"www.a.test\"]\nroot = \"a\"\ndefault = true\n\
-         [acme]\ndirectory = \"{}\"\nstorage = \"state\"\n",
-        pebble.url()
+         [acme]\ndirectory = '{}'\nca_root = '{}'\nstorage = \"state\"\n",
+        pebble.url(),
+        pebble.root().display()
     );
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::new(&dir.path().join("state"), pebble.url());
-    let server = Running::start_with_connector(dir, &text, pebble.connector()).await;
+    let server = Running::start_with(dir, &text).await;
     (server, pebble, storage)
 }
 

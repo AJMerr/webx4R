@@ -8,6 +8,7 @@ Early development; there are no releases yet. What works now:
 
 - Static files over HTTP/1.1 and HTTP/2
 - HTTPS with a certificate per site, picked by hostname (SNI); `localhost` sites get a self-signed certificate automatically
+- Automatic certificates from Let's Encrypt or another ACME CA, renewed before they expire, and HTTP → HTTPS redirects
 - Several sites on one listener, picked by hostname
 - Reverse proxy to apps by path prefix, with several upstreams per route, passive health checks, retries and WebSocket pass-through
 - ETag and Last-Modified, with 304 Not Modified responses
@@ -17,7 +18,7 @@ Early development; there are no releases yet. What works now:
 - Config reload without downtime, with `webx4r reload` or SIGHUP on Unix
 - Graceful shutdown on Ctrl-C, or SIGTERM on Unix
 
-Automatic certificates (ACME) and metrics are not built yet. They make up the rest of the first milestone.
+Access logs and metrics are not built yet. They make up the rest of the first milestone.
 
 Linux is the main target. Windows is supported and tested in CI.
 
@@ -86,6 +87,7 @@ Add one block per site.
 | `symlinks` | `"inside-root"` | `"inside-root"` follows relative links that stay inside `root`. `"follow"` follows any link. `"deny"` refuses all links. |
 | `cert` | none | PEM certificate chain for HTTPS, resolved like `root`. Needs `key` and `[server] https`. |
 | `key` | none | PEM private key for `cert`. |
+| `redirect_https` | `true` | Redirect plain HTTP to HTTPS for the site's hostnames that have a certificate. See [HTTPS](#https). |
 
 A request for an unknown hostname gets `421 Misdirected Request` when no site is the default. Unknown keys are rejected at startup, so typos don't go unnoticed.
 
@@ -119,7 +121,39 @@ The app sees the client's `Host` header, plus `X-Forwarded-For`, `X-Forwarded-Ho
 
 Set `[server] https` and give each site a `cert` and `key`. The server offers HTTP/2 and HTTP/1.1 over TLS, and picks each connection's certificate from the hostname the client sends (SNI). A client that sends an unknown name, or none, gets the default site's certificate.
 
-A site without cert files gets a self-signed certificate for its `localhost` and `*.localhost` names, plus `127.0.0.1` and `::1`. It's made fresh at every start and never saved, so browsers warn about it after each restart. A reload keeps it as long as the site's names stay the same. The warning is expected for local development.
+A site without cert files gets a self-signed certificate for its `localhost` and `*.localhost` names, plus `127.0.0.1` and `::1`. It's made fresh at every start and never saved, so browsers warn about it after each restart. A reload keeps it as long as the site's names stay the same. The warning is expected for local development. For public names, use [`[acme]`](#automatic-certificates-acme).
+
+With both `http` and `https` set, a plain HTTP request for a hostname that has a certificate gets a `308 Permanent Redirect` to the same URL over HTTPS. ACME challenges under `/.well-known/acme-challenge/` are never redirected, and neither are hostnames without a certificate. Set `redirect_https = false` to serve a site over both.
+
+### Automatic certificates (ACME)
+
+Add an `[acme]` table, and every site without `cert` and `key` gets a certificate for its hostnames from Let's Encrypt, or another CA that speaks ACME. `localhost` names keep their self-signed certificate, and IP addresses are skipped. Each site gets one certificate that covers all its names.
+
+```toml
+[server]
+http = "0.0.0.0:80"
+https = "0.0.0.0:443"
+
+[acme]
+email = "you@example.com"
+
+[[site]]
+hosts = ["example.com", "www.example.com"]
+root = "www"
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `email` | none | Address where the CA can reach you about your account. |
+| `directory` | `"production"` | `"production"` or `"staging"` for Let's Encrypt, or another CA's directory URL. Staging certificates aren't trusted by browsers, but its rate limits are far higher, so use it while testing. |
+| `storage` | see below | Folder for the account key and certificates, resolved like `root`. |
+| `ca_root` | none | PEM root certificate to trust for the CA's own HTTPS instead of the system's, for a private CA such as step-ca. |
+
+`[acme]` needs `[server] https`. The CA has to reach this server at each hostname: on port 80 for the HTTP-01 challenge, used when `[server] http` is set, or on port 443 for TLS-ALPN-01. If an attempt fails, the next one uses the other challenge. Retries wait 2 minutes, then 6, 18 and so on, up to 12 hours, and each failure is logged with the CA's reason. On Linux, listening on ports below 1024 needs root or the `CAP_NET_BIND_SERVICE` capability, for example `sudo setcap cap_net_bind_service=+ep target/release/webx4r`, or `AmbientCapabilities=CAP_NET_BIND_SERVICE` in a systemd unit.
+
+Certificates are renewed when a third of their lifetime is left, which is 30 days before expiry for Let's Encrypt's 90-day certificates. They're saved under `$XDG_STATE_HOME/webx4r/<id>/acme` on Unix (`~/.local/state/…` when that variable isn't set) and `%LOCALAPPDATA%\webx4r\<id>\acme` on Windows, named after the config's folder. The server logs the location at startup. Keys are readable only by their owner, and saved certificates are served right away after a restart.
+
+Registering an account accepts the CA's terms of service, which for Let's Encrypt is its [Subscriber Agreement](https://letsencrypt.org/repository/).
 
 ### Reloading
 
@@ -131,7 +165,7 @@ Edit the config, then apply it without a restart:
 
 On Unix, `kill -HUP <pid>` (or systemd's `ExecReload`) does the same. The new config is checked first. If anything is wrong, the error is printed and the server keeps its current config. Requests already in progress finish on the old config; every new request uses the new one, including on keep-alive connections that are already open.
 
-Sites, proxy routes and certificates all reload, so renewed certificate files take effect too. Changes to `[server]` need a restart.
+Sites, proxy routes and certificates all reload, so renewed certificate files take effect too, and new hostnames get ACME certificates. Changes to `[server]` and `[acme]` need a restart.
 
 `webx4r reload` reaches the server through a control socket that only its owner can use. On Unix it's `$XDG_RUNTIME_DIR/webx4r-<id>.sock`, named after the config's folder, or `webx4r.sock` next to the config when that variable isn't set. On Windows it's a named pipe. The server logs the location at startup. Set `[server] control` to choose it yourself.
 
@@ -145,10 +179,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 CI runs all three on Linux and Windows.
 
+The ACME tests need [Pebble](https://github.com/letsencrypt/pebble), Let's Encrypt's test CA, so they're skipped by default. To run them, put `pebble` and `pebble-challtestsrv` 2.7 or later on your `PATH`, then run `cargo test --workspace -- --include-ignored`. CI runs them on Linux.
+
 | Crate | Contents |
 |---|---|
 | `crates/webxlib` | HTTP building blocks: static files, MIME types, pages, response bodies |
-| `crates/webxcore` | The server: config, listeners, TLS, routing, reverse proxy |
+| `crates/webxcore` | The server: config, listeners, TLS, ACME, routing, reverse proxy |
 | `crates/webx4r` | The `webx4r` command |
 
 ## History

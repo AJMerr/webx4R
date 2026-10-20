@@ -50,6 +50,9 @@ pub struct Acme {
     /// Folder for the account key and certificates; resolved like `root`.
     /// See [`Config::acme_storage`] for the default.
     pub storage: Option<PathBuf>,
+    /// PEM root certificate to trust, instead of the system's, for the directory's HTTPS:
+    /// for private CAs such as step-ca or Pebble. Resolved like `root`.
+    pub ca_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -189,8 +192,10 @@ impl Config {
             // Pipe names are absolute paths on Windows, so `join` leaves them as they are.
             *control = base.join(&*control);
         }
-        if let Some(storage) = config.acme.as_mut().and_then(|acme| acme.storage.as_mut()) {
-            *storage = base.join(&*storage);
+        if let Some(acme) = &mut config.acme {
+            for path in [&mut acme.storage, &mut acme.ca_root].into_iter().flatten() {
+                *path = base.join(&*path);
+            }
         }
         for site in &mut config.sites {
             for path in [&mut site.root, &mut site.cert, &mut site.key].into_iter().flatten() {
@@ -608,11 +613,13 @@ mod tests {
 
     #[test]
     fn acme_settings() {
-        let acme = "email = \"me@example.com\"\ndirectory = \"staging\"\nstorage = \"state\"";
+        let acme = "email = \"me@example.com\"\ndirectory = \"staging\"\nstorage = \"state\"\n\
+                    ca_root = \"ca/root.pem\"";
         let config = parse(&(with_tls(HTTPS, "") + ACME + acme)).unwrap();
         let acme = config.acme.as_ref().unwrap();
         assert_eq!(acme.email.as_deref(), Some("me@example.com"));
         assert_eq!(acme.directory_url(), LETS_ENCRYPT_STAGING);
+        assert_eq!(acme.ca_root.as_deref(), Some(Path::new("/etc/webx4r/ca/root.pem")));
         assert_eq!(config.acme_storage(), Path::new("/etc/webx4r/state"));
     }
 
@@ -621,6 +628,7 @@ mod tests {
         let config = parse(&(with_tls(HTTPS, "") + ACME)).unwrap();
         let acme = config.acme.as_ref().unwrap();
         assert_eq!((acme.email.as_deref(), acme.storage.as_deref()), (None, None));
+        assert_eq!(acme.ca_root, None);
         assert_eq!(acme.directory_url(), LETS_ENCRYPT);
         assert_eq!(parse(MINIMAL).unwrap().acme, None, "off without [acme]");
     }
