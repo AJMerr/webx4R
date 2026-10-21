@@ -1781,7 +1781,7 @@ dependencies = [
 
 [[package]]
 name = "webx4r"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "rcgen",
@@ -1796,7 +1796,7 @@ dependencies = [
 
 [[package]]
 name = "webxcore"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -1822,7 +1822,7 @@ dependencies = [
 
 [[package]]
 name = "webxlib"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "cap-fs-ext",
