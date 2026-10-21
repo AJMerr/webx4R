@@ -4,7 +4,7 @@ A web server and app platform written in Rust. Today it serves static sites and 
 
 ## Status
 
-Early development; there are no releases yet. What works now:
+Version 1.0. Binaries for Linux and Windows are on the [releases page](https://github.com/AJMerr/webx4R/releases). What works now:
 
 - Static files over HTTP/1.1 and HTTP/2
 - HTTPS with a certificate per site, picked by hostname (SNI); `localhost` sites get a self-signed certificate automatically
